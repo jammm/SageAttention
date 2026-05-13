@@ -25,6 +25,12 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#if defined(__HIP_PLATFORM_AMD__)
+using nv_bfloat16 = __hip_bfloat16;
+using nv_bfloat162 = __hip_bfloat162;
+#define __float2bfloat16_rn __float2bfloat16
+#endif
+
 enum class QuantType
 {
   kInt8,
@@ -320,7 +326,11 @@ __global__ void MeanScaleKernel(T *__restrict__ input, int8_t *__restrict__ outp
                             const uint32_t stride_bz_mean, const uint32_t stride_h_mean,
                             const uint32_t stride_bz_scale, const uint32_t stride_h_scale)
 {
+#if defined(__HIP_PLATFORM_AMD__)
+  static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 are supported");
+#else
   static_assert(std::is_same<T, half>::value || std::is_same<T, __nv_bfloat16>::value, "Only half and bfloat16 are supported");
+#endif
 
   constexpr uint32_t pack_size = 8; // float4 contains 8 half or 8 bfloat16
 

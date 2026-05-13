@@ -16,6 +16,9 @@ limitations under the License.
 
 import torch
 import torch.nn.functional as F
+import importlib
+import subprocess
+import re
 
 from .triton.quant_per_block import per_block_int8 as per_block_int8_triton
 from .triton.quant_per_block_varlen import per_block_int8 as per_block_int8_varlen_triton
@@ -44,6 +47,15 @@ try:
 except:
     SM90_ENABLED = False
 
+try:
+    _qattn_gfx12_native = importlib.import_module("sageattention._qattn_gfx12_native")
+    _qattn_gfx12_prepare_attn_hnd = _qattn_gfx12_native.qk_int8_sv_f16_d64_prepare_attn_hnd
+    GFX12_NATIVE_ENABLED = True
+except Exception:
+    _qattn_gfx12_native = None
+    _qattn_gfx12_prepare_attn_hnd = None
+    GFX12_NATIVE_ENABLED = False
+
 from .quant import per_block_int8 as per_block_int8_cuda
 from .quant import per_warp_int8 as per_warp_int8_cuda
 from .quant import sub_mean
@@ -51,9 +63,6 @@ from .quant import per_channel_fp8
 
 from typing import Any, List, Literal, Optional, Tuple, Union
 import warnings
-
-import subprocess
-import re
 
 
 def get_cuda_version():
@@ -70,10 +79,245 @@ def get_cuda_version():
 
 def get_cuda_arch_versions():
     cuda_archs = []
-    for i in range(torch.cuda.device_count()):
-        major, minor = torch.cuda.get_device_capability(i)
-        cuda_archs.append(f"sm{major}{minor}")
+    if torch.version.hip is not None:
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            arch = getattr(props, "gcnArchName", "")
+            cuda_archs.append(arch.split(":", 1)[0] if arch else "")
+    else:
+        for i in range(torch.cuda.device_count()):
+            major, minor = torch.cuda.get_device_capability(i)
+            cuda_archs.append(f"sm{major}{minor}")
     return cuda_archs
+
+
+def _get_gfx12_native_extension():
+    global _qattn_gfx12_native, _qattn_gfx12_prepare_attn_hnd, GFX12_NATIVE_ENABLED
+    if _qattn_gfx12_native is None:
+        _qattn_gfx12_native = importlib.import_module("sageattention._qattn_gfx12_native")
+        _qattn_gfx12_prepare_attn_hnd = _qattn_gfx12_native.qk_int8_sv_f16_d64_prepare_attn_hnd
+        GFX12_NATIVE_ENABLED = True
+    return _qattn_gfx12_native
+
+
+def _get_gfx12_prepare_attn_hnd():
+    _get_gfx12_native_extension()
+    return _qattn_gfx12_prepare_attn_hnd
+
+
+def sageattn_qk_int8_pv_gfx12_native(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    sm_scale: Optional[float] = None,
+    value_dtype: str = "fp8",
+    smooth_k: bool = False,
+    return_lse: bool = False,
+    **kwargs: Any,
+) -> torch.Tensor:
+    """
+    ROCm gfx12 native SageAttention path.
+
+    Supports fixed-length attention, with NHD inputs internally converted to
+    the HND-contiguous native execution layout.
+
+    Current gfx12 constraints:
+    - q, k, and v must be fp16 or bf16.
+    - q_len and kv_len must be multiples of 64.
+    - value_dtype="fp8" supports head_dim 16, 64, or 128.
+    - value_dtype="fp16" supports head_dim 16 or 64.
+    - Causal masking requires q_len == kv_len.
+    - smooth_k is supported for output-only calls.
+    - return_lse is not implemented yet.
+    """
+
+    gfx12_native = _get_gfx12_native_extension()
+    gfx12_prepare_attn_hnd = _qattn_gfx12_prepare_attn_hnd
+    value_dtype_normalized = value_dtype.lower()
+    if value_dtype_normalized == "auto":
+        value_dtype_normalized = "fp8"
+    if (
+        tensor_layout == "HND"
+        and value_dtype_normalized == "fp8"
+        and not smooth_k
+        and not return_lse
+        and q.dim() == 4
+        and k.dim() == 4
+        and v.dim() == 4
+        and q.is_cuda
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and v.is_contiguous()
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q.dtype == k.dtype == v.dtype
+        and q.device == k.device == v.device
+        and q.size(-1) in (16, 64, 128)
+    ):
+        torch.cuda.set_device(v.device)
+        return gfx12_prepare_attn_hnd(
+            q,
+            k,
+            v,
+            int(is_causal),
+            1,
+            0,
+            float(sm_scale if sm_scale is not None else q.size(-1) ** -0.5),
+        )
+    if (
+        tensor_layout == "HND"
+        and value_dtype_normalized == "fp16"
+        and not smooth_k
+        and not return_lse
+        and q.dim() == 4
+        and k.dim() == 4
+        and v.dim() == 4
+        and q.is_cuda
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and v.is_contiguous()
+        and q.dtype == torch.float16
+        and q.dtype == k.dtype == v.dtype
+        and q.device == k.device == v.device
+        and q.size(-1) in (16, 64)
+    ):
+        torch.cuda.set_device(v.device)
+        use_raw_f16_value = is_causal and q.size(-1) == 64 and q.size(2) <= 512
+        return gfx12_prepare_attn_hnd(
+            q,
+            k,
+            v,
+            int(is_causal),
+            0,
+            int(use_raw_f16_value),
+            float(sm_scale if sm_scale is not None else q.size(-1) ** -0.5),
+        )
+
+    assert q.is_cuda, "Input tensors must be on cuda/HIP."
+    assert q.device == k.device == v.device, "All tensors must be on the same device."
+    assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
+    assert q.dtype in [torch.float16, torch.bfloat16], "gfx12 native path supports fp16/bf16 inputs."
+    assert tensor_layout in ["HND", "NHD"], "tensor_layout must be either 'HND' or 'NHD'."
+    if return_lse:
+        raise ValueError("gfx12 native path does not return LSE yet.")
+    torch.cuda.set_device(v.device)
+
+    input_dtype = q.dtype
+    value_dtype = value_dtype_normalized
+    if value_dtype not in {"fp16", "fp8"}:
+        raise ValueError("gfx12 native value_dtype must be 'auto', 'fp16', or 'fp8'.")
+    if sm_scale is None and q.dim() == 4:
+        sm_scale = q.size(-1) ** -0.5
+
+    if (
+        tensor_layout == "HND"
+        and not smooth_k
+        and q.dim() == 4
+        and k.dim() == 4
+        and v.dim() == 4
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and v.is_contiguous()
+        and q.size(-1) in (16, 64, 128)
+        and (value_dtype == "fp8" or q.size(-1) in (16, 64))
+    ):
+        use_raw_f16_value = (
+            value_dtype == "fp16"
+            and input_dtype == torch.float16
+            and is_causal
+            and q.size(-1) == 64
+            and q.size(2) <= 512
+        )
+        out = gfx12_prepare_attn_hnd(
+            q,
+            k,
+            v,
+            int(is_causal),
+            int(value_dtype == "fp8"),
+            int(use_raw_f16_value),
+            float(sm_scale),
+        )
+        if input_dtype == torch.bfloat16:
+            return out if out.dtype == torch.bfloat16 else gfx12_native.convert_f16_to_bf16(out)
+        return out
+
+    if tensor_layout == "NHD":
+        q_hnd = q.transpose(1, 2).contiguous()
+        k_hnd = k.transpose(1, 2).contiguous()
+        v_hnd = v.transpose(1, 2).contiguous()
+    else:
+        q_hnd = q.contiguous()
+        k_hnd = k.contiguous()
+        v_hnd = v.contiguous()
+
+    _, h_qo, qo_len, head_dim_og = q_hnd.shape
+    _, h_kv, kv_len, _ = k_hnd.shape
+    if h_qo % h_kv != 0:
+        raise ValueError("num_qo_heads must be divisible by num_kv_heads.")
+    if qo_len % 64 != 0 or kv_len % 64 != 0:
+        raise ValueError("gfx12 native path requires q_len and kv_len to be multiples of 64.")
+    if is_causal and qo_len != kv_len:
+        raise ValueError("gfx12 causal path currently requires q_len == kv_len.")
+
+    head_dim = head_dim_og
+    if head_dim < 64 and head_dim != 16:
+        pad = 64 - head_dim
+        q_hnd = F.pad(q_hnd, (0, pad))
+        k_hnd = F.pad(k_hnd, (0, pad))
+        v_hnd = F.pad(v_hnd, (0, pad))
+        head_dim = 64
+    elif value_dtype == "fp8" and 64 < head_dim < 128:
+        pad = 128 - head_dim
+        q_hnd = F.pad(q_hnd, (0, pad))
+        k_hnd = F.pad(k_hnd, (0, pad))
+        v_hnd = F.pad(v_hnd, (0, pad))
+        head_dim = 128
+
+    if value_dtype == "fp16" and head_dim not in (16, 64):
+        raise ValueError("gfx12 fp16 value path currently supports head_dim 16 or 64.")
+    if value_dtype == "fp8" and head_dim not in (16, 64, 128):
+        raise ValueError("gfx12 fp8 value path currently supports head_dim 16, 64, or 128.")
+
+    use_raw_f16_value = (
+        value_dtype == "fp16"
+        and input_dtype == torch.float16
+        and is_causal
+        and head_dim == 64
+        and qo_len <= 512
+    )
+
+    k_mean = k_hnd.mean(dim=2, keepdim=True) if smooth_k else None
+    if not smooth_k:
+        out = gfx12_prepare_attn_hnd(
+            q_hnd,
+            k_hnd,
+            v_hnd,
+            int(is_causal),
+            int(value_dtype == "fp8"),
+            int(use_raw_f16_value),
+            float(sm_scale),
+        )
+    else:
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(
+            q_hnd, k_hnd, k_mean, BLKQ=128, WARPQ=32, BLKK=64, tensor_layout="HND"
+        )
+        out = torch.empty_like(q_hnd, dtype=torch.float16)
+        if value_dtype == "fp8":
+            value_native = gfx12_native.transpose_value_fp8_hnd(v_hnd)
+        else:
+            value_native = gfx12_native.transpose_value_f16_hnd(v_hnd)
+        gfx12_native.qk_int8_sv_f16_d64_native_attn(
+            q_int8, k_int8, value_native, out, q_scale, k_scale, 1, int(is_causal), float(sm_scale)
+        )
+    out = out[..., :head_dim_og]
+    if input_dtype == torch.bfloat16 and out.dtype != torch.bfloat16:
+        out = gfx12_native.convert_f16_to_bf16(out.contiguous() if not out.is_contiguous() else out)
+    elif input_dtype != torch.float16:
+        out = out.to(input_dtype)
+    if tensor_layout == "NHD":
+        out = out.transpose(1, 2).contiguous()
+    return out
 
 
 def sageattn(
@@ -141,6 +385,10 @@ def sageattn(
     """
         
     arch = get_cuda_arch_versions()[q.device.index]
+    if arch.startswith("gfx12"):
+        return sageattn_qk_int8_pv_gfx12_native(
+            q, k, v, tensor_layout=tensor_layout, is_causal=is_causal,
+            sm_scale=sm_scale, return_lse=return_lse, **kwargs)
     if arch == "sm80":
         return sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal, sm_scale=sm_scale, return_lse=return_lse, pv_accum_dtype="fp32")
     elif arch == "sm86":
