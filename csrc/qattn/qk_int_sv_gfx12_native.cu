@@ -374,6 +374,27 @@ __device__ __forceinline__ int wmma_f16_k_for_lane_elem(
   return ((reg >> 1) << 3) + (((lane >> 4) & 1) << 2) + ((reg & 1) << 1) + half;
 }
 
+template <bool PvOrdered = false>
+__device__ __forceinline__ void apply_tqk_kv_tail_mask(
+    float8_vec& scores,
+    const int64_t valid_kv_len,
+    const int64_t kb_base,
+    const int col_tile,
+    const int lane) {
+  const int64_t col_base = kb_base + static_cast<int64_t>(col_tile) * 16;
+  if (col_base + 15 < valid_kv_len) {
+    return;
+  }
+#pragma unroll
+  for (int elem = 0; elem < 8; ++elem) {
+    const int k_local = PvOrdered ?
+        wmma_f16_k_for_lane_elem(lane, elem) :
+        (((lane >> 4) << 3) + elem);
+    scores[elem] = (col_base + k_local) >= valid_kv_len ?
+        -FLT_MAX * 0.5f : scores[elem];
+  }
+}
+
 __device__ __forceinline__ int gfx12_tr_b128_source_row_for_lane(const int lane) {
   const int quad_group = lane >> 2;
   const int quad_pos = lane & 3;
@@ -1346,6 +1367,9 @@ SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32,
             }
           }
         }
+        if (k_col_start + BK > kv_len) {
+          apply_tqk_kv_tail_mask<PvOrderedQK>(scores, kv_len, kb_base, col_tile, lane);
+        }
         score_cache[col_tile] = scores;
 #pragma unroll
         for (int elem = 0; elem < 8; ++elem) {
@@ -1440,6 +1464,7 @@ SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32,
         const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * BK);
         const float score_scale = qs *
             k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+        const int64_t k_col_start = kb_base + static_cast<int64_t>(col_tile) * BK;
         float8_vec scores;
         if constexpr (QuantizeQuery || UseRawPreparedQ) {
           scores = compute_tqk_score_regs_raw_kq<DTiles, SharedHeadStride>(
@@ -1447,6 +1472,9 @@ SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32,
         } else {
           scores = compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
               &k_tile[0][0], q_frag, col_tile, score_scale);
+        }
+        if (k_col_start + BK > kv_len) {
+          apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
         }
         for (int elem = 0; elem < 8; ++elem) {
           local_max = fmaxf(local_max, scores[elem]);
@@ -1474,6 +1502,7 @@ SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32,
         const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * BK);
         const float score_scale = qs *
             k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+        const int64_t k_col_start = kb_base + static_cast<int64_t>(col_tile) * BK;
         float8_vec scores;
           if constexpr (QuantizeQuery || UseRawPreparedQ) {
             scores = compute_tqk_score_regs_raw_kq<DTiles, SharedHeadStride>(
@@ -1481,6 +1510,9 @@ SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32,
           } else {
           scores = compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
               &k_tile[0][0], q_frag, col_tile, score_scale);
+        }
+        if (k_col_start + BK > kv_len) {
+          apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
         }
         half8_vec prob_values;
 #pragma unroll
@@ -2066,6 +2098,12 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                 }
               }
             }
+            if (k_col_start + BK > kv_len) {
+              apply_tqk_kv_tail_mask<PvOrderedQK>(
+                  scores0[gc], kv_len, kb_base, col_tile, lane);
+              apply_tqk_kv_tail_mask<PvOrderedQK>(
+                  scores1[gc], kv_len, kb_base, col_tile, lane);
+            }
           }
           if (!any_work) {
             continue;
@@ -2250,6 +2288,12 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
               }
             }
           }
+          if (k_col_start + BK > kv_len) {
+            apply_tqk_kv_tail_mask<PvOrderedQK>(
+                scores0, kv_len, kb_base, col_tile, lane);
+            apply_tqk_kv_tail_mask<PvOrderedQK>(
+                scores1, kv_len, kb_base, col_tile, lane);
+          }
           score_cache[0][col_tile] = scores0;
           score_cache[1][col_tile] = scores1;
 #pragma unroll
@@ -2341,6 +2385,9 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                       col_tile, lane);
                 }
               }
+            }
+            if (k_col_start + BK > kv_len) {
+              apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
             }
             score_cache[col_tile] = scores;
 #pragma unroll
@@ -2488,6 +2535,9 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                   scores, static_cast<int>(q_start[qg]), static_cast<int>(kb_base), col_tile, lane);
             }
           }
+          if (kb_base + static_cast<int64_t>(col_tile) * BK + BK > kv_len) {
+            apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
+          }
 #pragma unroll
           for (int elem = 0; elem < 8; ++elem) {
             local_max = fmaxf(local_max, scores[elem]);
@@ -2538,6 +2588,9 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
               apply_tqk_causal_mask<true>(
                   scores, static_cast<int>(q_start[qg]), static_cast<int>(kb_base), col_tile, lane);
             }
+          }
+          if (kb_base + static_cast<int64_t>(col_tile) * BK + BK > kv_len) {
+            apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
           }
           half8_vec prob_values;
 #pragma unroll
@@ -3165,6 +3218,9 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
                     }
                   }
                 }
+                if (k_col_start + BK > kv_len) {
+                  apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
+                }
                 score_cache_stream[qg][sc] = scores;
 #pragma unroll
                 for (int elem = 0; elem < 8; ++elem) {
@@ -3215,6 +3271,9 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
                             static_cast<int>(kb_base), col_tile, lane);
                       }
                     }
+                  }
+                  if (k_col_start + BK > kv_len) {
+                    apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
                   }
                   score_cache_stream[qg][sc] = scores;
 #pragma unroll
@@ -3449,6 +3508,9 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
                 }
               }
             }
+            if (k_col_start + BK > kv_len) {
+              apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
+            }
             score_cache[qg][col_tile] = scores;
 #pragma unroll
             for (int elem = 0; elem < 8; ++elem) {
@@ -3552,6 +3614,9 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
                     scores, static_cast<int>(q_start[qg]), static_cast<int>(kb_base), col_tile, lane);
               }
             }
+          }
+          if (k_col_start + BK > kv_len) {
+            apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
           }
           score_cache[col_tile] = scores;
 #pragma unroll
@@ -3705,6 +3770,9 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
                     scores, static_cast<int>(q_start[qg]), static_cast<int>(kb_base), col_tile, lane);
               }
             }
+          }
+          if (k_col_start + BK > kv_len) {
+            apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
           }
           score_cache[col_tile] = scores;
 #pragma unroll
@@ -5572,7 +5640,8 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     torch::Tensor key_scale,
     int tensor_layout,
     int is_causal,
-    float sm_scale);
+    float sm_scale,
+    int64_t valid_kv_len);
 
 torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     torch::Tensor query,
@@ -5581,7 +5650,8 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     int is_causal,
     int value_is_fp8,
     int use_raw_f16_value,
-    float sm_scale) {
+    float sm_scale,
+    int64_t valid_kv_len) {
   TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda(),
               "native gfx12 prepare+attention expects CUDA/HIP tensors");
   TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4,
@@ -5602,17 +5672,20 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
   const int64_t q_heads = query.size(1);
   const int64_t q_len = query.size(2);
   const int64_t kv_heads = key.size(1);
-  const int64_t kv_len = key.size(2);
+  const int64_t padded_kv_len = key.size(2);
+  const int64_t kv_len = valid_kv_len > 0 ? valid_kv_len : padded_kv_len;
+  TORCH_CHECK(kv_len > 0 && kv_len <= padded_kv_len,
+              "valid_kv_len must be in (0, padded_kv_len]");
   TORCH_CHECK(key.size(0) == batch && value.size(0) == batch,
               "Q/K/V batch size mismatch");
   TORCH_CHECK(key.size(3) == head_dim && value.size(3) == head_dim,
               "Q/K/V head_dim mismatch");
-  TORCH_CHECK(key.size(2) == kv_len && value.size(2) == kv_len && value.size(1) == kv_heads,
+  TORCH_CHECK(value.size(2) == padded_kv_len && value.size(1) == kv_heads,
               "K/V shape mismatch");
   TORCH_CHECK((q_heads % kv_heads) == 0, "q_heads must be divisible by kv_heads");
-  TORCH_CHECK((q_len % 64) == 0 && (kv_len % 64) == 0,
+  TORCH_CHECK((q_len % 64) == 0 && (padded_kv_len % 64) == 0,
               "native gfx12 prepare+attention requires sequence lengths divisible by 64");
-  TORCH_CHECK(!is_causal || q_len == kv_len,
+  TORCH_CHECK(!is_causal || q_len == padded_kv_len,
               "native gfx12 causal prepare+attention requires q_len == kv_len");
 
   const auto output_dtype =
@@ -6140,7 +6213,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     std::vector<torch::Tensor> prepared = quant_qk_int8_hnd_gfx12(query, key);
     qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         prepared[0], prepared[2], value, output, prepared[1], prepared[3],
-        kHND, is_causal, sm_scale);
+        kHND, is_causal, sm_scale, kv_len);
   } else {
     const bool use_f16_separate_prepared =
         is_causal && head_dim == 64 && q_len == 4096 &&
@@ -6151,7 +6224,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
              prepare_qkv_hnd_packed_gfx12<__half, false>(query, key, value);
     qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         prepared[0], prepared[2], prepared[4], output, prepared[1], prepared[3],
-        kHND, is_causal, sm_scale);
+        kHND, is_causal, sm_scale, kv_len);
   }
   return output;
 }
@@ -6165,7 +6238,8 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     torch::Tensor key_scale,
     int tensor_layout,
     int is_causal,
-    float sm_scale) {
+    float sm_scale,
+    int64_t valid_kv_len) {
   TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && output.is_cuda(),
               "native gfx12 tensors must be CUDA/HIP tensors");
   TORCH_CHECK(query.scalar_type() == torch::kInt8, "query must be int8");
@@ -6192,15 +6266,18 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   const int64_t q_heads = tensor_layout == kNHD ? query.size(2) : query.size(1);
   const int64_t q_len = tensor_layout == kNHD ? query.size(1) : query.size(2);
   const int64_t kv_heads = tensor_layout == kNHD ? key.size(2) : key.size(1);
-  const int64_t kv_len = tensor_layout == kNHD ? key.size(1) : key.size(2);
-  const bool value_transposed_hnd = value_maybe_transposed_hnd && value.size(3) >= kv_len;
+  const int64_t padded_kv_len = tensor_layout == kNHD ? key.size(1) : key.size(2);
+  const int64_t kv_len = valid_kv_len > 0 ? valid_kv_len : padded_kv_len;
+  TORCH_CHECK(kv_len > 0 && kv_len <= padded_kv_len,
+              "valid_kv_len must be in (0, padded_kv_len]");
+  const bool value_transposed_hnd = value_maybe_transposed_hnd && value.size(3) >= padded_kv_len;
   TORCH_CHECK(!value_maybe_transposed_hnd || value_transposed_hnd,
               "transposed HND value must have shape [B, H, D, padded_kv_len]");
   TORCH_CHECK(!value_transposed_hnd || value.is_contiguous(),
               "transposed HND value must be contiguous");
-  TORCH_CHECK((q_len % 64) == 0 && (kv_len % 64) == 0,
+  TORCH_CHECK((q_len % 64) == 0 && (padded_kv_len % 64) == 0,
               "native gfx12 path requires q_len and kv_len multiples of 64");
-  TORCH_CHECK(!is_causal || q_len == kv_len,
+  TORCH_CHECK(!is_causal || q_len == padded_kv_len,
               "native gfx12 causal path currently requires q_len == kv_len");
   TORCH_CHECK((q_heads % kv_heads) == 0, "q_heads must be divisible by kv_heads");
   TORCH_CHECK(query_scale.stride(-1) == 1 && key_scale.stride(-1) == 1,
@@ -6836,8 +6913,9 @@ torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
     torch::Tensor key_scale,
     int tensor_layout,
     int is_causal,
-    float sm_scale) {
+    float sm_scale,
+    int64_t valid_kv_len) {
   return qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query, key, value, output, query_scale, key_scale, tensor_layout,
-      is_causal, sm_scale);
+      is_causal, sm_scale, valid_kv_len);
 }
