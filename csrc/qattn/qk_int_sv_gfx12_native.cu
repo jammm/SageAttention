@@ -411,6 +411,48 @@ torch::Tensor transpose_value_hnd_gfx12(torch::Tensor value) {
   return output;
 }
 
+template <typename T>
+__global__ void transpose_value_fp8_scaled_hnd_kernel(
+    const T* __restrict__ value,
+    const float* __restrict__ value_scale,
+    uint8_t* __restrict__ output,
+    const int64_t total_heads,
+    const int64_t seq_len,
+    const int64_t head_dim) {
+  constexpr int TileS = 128;
+  constexpr int TileD = 16;
+  __shared__ uint8_t tile[TileS][TileD];
+
+  const int tid = threadIdx.x;
+  const int64_t bh = blockIdx.z;
+
+  for (int linear = tid; linear < TileS * TileD; linear += blockDim.x) {
+    const int load_s = linear / TileD;
+    const int load_d = linear - load_s * TileD;
+    const int64_t s = static_cast<int64_t>(blockIdx.x) * TileS + load_s;
+    const int64_t d = static_cast<int64_t>(blockIdx.y) * TileD + load_d;
+    if (bh < total_heads && s < seq_len && d < head_dim) {
+      const float scale = value_scale[bh * head_dim + d];
+      const float v = scale == 0.0f ? 0.0f :
+          value_to_float(value[(bh * seq_len + s) * head_dim + d]) / scale;
+      tile[load_s][load_d] =
+          __hip_cvt_float_to_fp8(v, __HIP_SATFINITE, __HIP_E4M3);
+    }
+  }
+  __syncthreads();
+
+  for (int linear = tid; linear < TileS * TileD; linear += blockDim.x) {
+    const int store_d_local = linear / TileS;
+    const int store_s_local = linear - store_d_local * TileS;
+    const int64_t store_s = static_cast<int64_t>(blockIdx.x) * TileS + store_s_local;
+    const int64_t store_d = static_cast<int64_t>(blockIdx.y) * TileD + store_d_local;
+    if (bh < total_heads && store_s < seq_len && store_d < head_dim) {
+      output[(bh * head_dim + store_d) * seq_len + store_s] =
+          tile[store_s_local][store_d_local];
+    }
+  }
+}
+
 __device__ __forceinline__ int64_t qkv_offset(
     const int tensor_layout,
     const int64_t b,
@@ -2865,6 +2907,7 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
     OutputT* __restrict__ output,
     const float* __restrict__ q_scale,
     const float* __restrict__ k_scale,
+    const float* __restrict__ v_scale,
     const int64_t batch_size,
     const int64_t qo_len,
     const int64_t kv_len,
@@ -4026,6 +4069,8 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
 #pragma unroll
     for (int vdt = 0; vdt < ValueTiles; ++vdt) {
       const int d = (ValueTileBase + vdt) * BK + col;
+      const float value_scale = v_scale == nullptr ?
+          1.0f : v_scale[(b * num_kv_heads + hkv) * HeadDim + d];
 #pragma unroll
       for (int pair = 0; pair < PackedRows; ++pair) {
         const int elem = pair * 2;
@@ -4033,8 +4078,10 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
         const int64_t q_idx1 = q_idx0 + 1;
         const float l_sum0 = l_rows[elem];
         const float l_sum1 = l_rows[elem + 1];
-        const float value0 = l_sum0 == 0.0f ? 0.0f : out_frag[qg][vdt][elem] / l_sum0;
-        const float value1 = l_sum1 == 0.0f ? 0.0f : out_frag[qg][vdt][elem + 1] / l_sum1;
+        const float value0 = l_sum0 == 0.0f ?
+            0.0f : (out_frag[qg][vdt][elem] / l_sum0) * value_scale;
+        const float value1 = l_sum1 == 0.0f ?
+            0.0f : (out_frag[qg][vdt][elem + 1] / l_sum1) * value_scale;
         store_output_value(output, qkv_offset_dispatch<HeadDim, HndContiguous>(
             tensor_layout, b, hq, q_idx0, d, o_stride_b, o_stride_n, o_stride_h), value0);
         store_output_value(output, qkv_offset_dispatch<HeadDim, HndContiguous>(
@@ -4870,6 +4917,51 @@ __global__ void prepare_kv_hnd_fp8_kernel(
 
 torch::Tensor transpose_value_fp8_hnd_gfx12(torch::Tensor value) {
   return transpose_value_hnd_gfx12<uint8_t, true>(value);
+}
+
+torch::Tensor transpose_value_fp8_scaled_hnd_gfx12(
+    torch::Tensor value,
+    torch::Tensor value_scale) {
+  TORCH_CHECK(value.is_cuda() && value_scale.is_cuda(),
+              "gfx12 scaled value transpose expects CUDA/HIP tensors");
+  TORCH_CHECK(value.dim() == 4, "gfx12 scaled value transpose expects [B, H, S, D]");
+  TORCH_CHECK(value.is_contiguous(), "gfx12 scaled value transpose expects contiguous HND input");
+  TORCH_CHECK(value.scalar_type() == torch::kFloat16 || value.scalar_type() == torch::kBFloat16,
+              "gfx12 scaled value transpose supports fp16/bf16 input");
+  TORCH_CHECK(value_scale.scalar_type() == torch::kFloat32,
+              "gfx12 value scale must be fp32");
+  TORCH_CHECK(value_scale.dim() == 3 && value_scale.is_contiguous(),
+              "gfx12 value scale expects contiguous [B, H, D]");
+  TORCH_CHECK(value_scale.size(0) == value.size(0) &&
+                  value_scale.size(1) == value.size(1) &&
+                  value_scale.size(2) == value.size(3),
+              "gfx12 value scale shape must match [B, H, D]");
+
+  const int64_t batch = value.size(0);
+  const int64_t heads = value.size(1);
+  const int64_t seq_len = value.size(2);
+  const int64_t head_dim = value.size(3);
+  torch::Tensor output =
+      torch::empty({batch, heads, head_dim, seq_len}, value.options().dtype(torch::kUInt8));
+
+  dim3 block(256);
+  dim3 grid((seq_len + 127) / 128, (head_dim + 15) / 16, batch * heads);
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (value.scalar_type() == torch::kFloat16) {
+    transpose_value_fp8_scaled_hnd_kernel<__half><<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
+        value_scale.data_ptr<float>(),
+        output.data_ptr<uint8_t>(),
+        batch * heads, seq_len, head_dim);
+  } else {
+    transpose_value_fp8_scaled_hnd_kernel<__hip_bfloat16><<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
+        value_scale.data_ptr<float>(),
+        output.data_ptr<uint8_t>(),
+        batch * heads, seq_len, head_dim);
+  }
+  hip_kernel_launch_check();
+  return output;
 }
 
 torch::Tensor transpose_value_f16_hnd_gfx12(torch::Tensor value) {
@@ -5806,7 +5898,8 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     int tensor_layout,
     int is_causal,
     float sm_scale,
-    int64_t valid_kv_len);
+    int64_t valid_kv_len,
+    torch::Tensor value_scale = torch::Tensor());
 
 torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     torch::Tensor query,
@@ -6018,7 +6111,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         prepared[0].data_ptr<int8_t>(), prepared[2].data_ptr<int8_t>(), \
         prepared[4].data_ptr<uint8_t>(), \
         reinterpret_cast<OUT_T_*>(output.data_ptr()), \
-        prepared[1].data_ptr<float>(), prepared[3].data_ptr<float>(), \
+        prepared[1].data_ptr<float>(), prepared[3].data_ptr<float>(), nullptr, \
         batch, q_len, kv_len, q_heads, kv_heads, \
         prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
         prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
@@ -6035,7 +6128,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), fused_key_ptr, \
         fused_value_ptr, \
         reinterpret_cast<__half*>(output.data_ptr()), \
-        nullptr, fused_k_scale_ptr, \
+        nullptr, fused_k_scale_ptr, nullptr, \
         batch, q_len, kv_len, q_heads, kv_heads, \
         query.stride(0), query.stride(2), query.stride(1), \
         fused_k_stride_b, fused_k_stride_n, fused_k_stride_h, \
@@ -6404,7 +6497,8 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     int tensor_layout,
     int is_causal,
     float sm_scale,
-    int64_t valid_kv_len) {
+    int64_t valid_kv_len,
+    torch::Tensor value_scale) {
   TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && output.is_cuda(),
               "native gfx12 tensors must be CUDA/HIP tensors");
   TORCH_CHECK(query.scalar_type() == torch::kInt8, "query must be int8");
@@ -6447,6 +6541,21 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   TORCH_CHECK((q_heads % kv_heads) == 0, "q_heads must be divisible by kv_heads");
   TORCH_CHECK(query_scale.stride(-1) == 1 && key_scale.stride(-1) == 1,
               "scale tensors must have contiguous scale columns");
+  const bool has_value_scale = value_scale.defined() && value_scale.numel() > 0;
+  TORCH_CHECK(!has_value_scale || value_is_fp8,
+              "value_scale is only valid for the fp8 value path");
+  if (has_value_scale) {
+    TORCH_CHECK(value_scale.is_cuda(), "value_scale must be a CUDA/HIP tensor");
+    TORCH_CHECK(value_scale.scalar_type() == torch::kFloat32,
+                "value_scale must be fp32");
+    TORCH_CHECK(value_scale.dim() == 3 && value_scale.is_contiguous(),
+                "value_scale must be contiguous [B, H_kv, D]");
+    TORCH_CHECK(value_scale.size(0) == batch &&
+                    value_scale.size(1) == kv_heads &&
+                    value_scale.size(2) == head_dim,
+                "value_scale shape must match [B, H_kv, D]");
+  }
+  const float* value_scale_ptr = has_value_scale ? value_scale.data_ptr<float>() : nullptr;
   const bool hnd_contiguous = tensor_layout == kHND &&
       query.is_contiguous() && key.is_contiguous() &&
       value.is_contiguous() && output.is_contiguous();
@@ -6552,7 +6661,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
       value.data_ptr<uint8_t>(), \
       reinterpret_cast<OUT_T_*>(output.data_ptr()), \
-      query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), \
+      query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), value_scale_ptr, \
       batch, q_len, kv_len, q_heads, kv_heads, \
       query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
       key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
@@ -6566,7 +6675,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
       value.data_ptr<uint8_t>(), \
       reinterpret_cast<OUT_T_*>(output.data_ptr()), \
-      query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), \
+      query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), value_scale_ptr, \
       batch, q_len, kv_len, q_heads, kv_heads, \
       query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
       key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
@@ -6588,7 +6697,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
       value.data_ptr<uint8_t>(), \
       reinterpret_cast<OUT_T_*>(output.data_ptr()), \
-      query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), \
+      query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), value_scale_ptr, \
       batch, q_len, kv_len, q_heads, kv_heads, \
       query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
       key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
@@ -6602,7 +6711,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
       value.data_ptr<uint8_t>(), \
       reinterpret_cast<OUT_T_*>(output.data_ptr()), \
-      query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), \
+      query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), value_scale_ptr, \
       batch, q_len, kv_len, q_heads, kv_heads, \
       query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
       key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
@@ -6930,7 +7039,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         query.data_ptr<int8_t>(), key.data_ptr<int8_t>(),
         value.data_ptr<uint8_t>(),
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
-        query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
+        query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), value_scale_ptr,
         batch, q_len, kv_len, q_heads, kv_heads,
         query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1),
         key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1),
@@ -6944,7 +7053,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         query.data_ptr<int8_t>(), key.data_ptr<int8_t>(),
         value.data_ptr<uint8_t>(),
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
-        query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
+        query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), value_scale_ptr,
         batch, q_len, kv_len, q_heads, kv_heads,
         query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1),
         key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1),
@@ -7069,12 +7178,13 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   return torch::empty({0}, query.options().dtype(torch::kFloat32));
 }
 
-torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
+static torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
     torch::Tensor query,
     torch::Tensor key,
     torch::Tensor value,
     torch::Tensor output,
     torch::Tensor key_scale,
+    torch::Tensor value_scale,
     int tensor_layout,
     int is_causal,
     float sm_scale,
@@ -7142,6 +7252,19 @@ torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
   TORCH_CHECK(!is_causal || q_len == padded_kv_len,
               "raw-Q gfx12 causal attention requires q_len == padded_kv_len");
   TORCH_CHECK(key_scale.stride(-1) == 1, "key_scale must have contiguous scale columns");
+  const bool has_value_scale = value_scale.defined() && value_scale.numel() > 0;
+  if (has_value_scale) {
+    TORCH_CHECK(value_scale.is_cuda(), "value_scale must be a CUDA/HIP tensor");
+    TORCH_CHECK(value_scale.scalar_type() == torch::kFloat32,
+                "value_scale must be fp32");
+    TORCH_CHECK(value_scale.dim() == 3 && value_scale.is_contiguous(),
+                "value_scale must be contiguous [B, H_kv, D]");
+    TORCH_CHECK(value_scale.size(0) == batch &&
+                    value_scale.size(1) == kv_heads &&
+                    value_scale.size(2) == head_dim,
+                "value_scale shape must match [B, H_kv, D]");
+  }
+  const float* value_scale_ptr = has_value_scale ? value_scale.data_ptr<float>() : nullptr;
 
   int block_rows = head_dim == 64 ?
       select_fp8_d64_block_rows_gfx12(q_len, is_causal, false) :
@@ -7167,7 +7290,7 @@ torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
       reinterpret_cast<const QUERY_T_*>(query.data_ptr<QUERY_AT_T_>()), \
       key.data_ptr<int8_t>(), value.data_ptr<uint8_t>(), \
       reinterpret_cast<OUT_T_*>(output.data_ptr<OUT_AT_T_>()), \
-      nullptr, key_scale.data_ptr<float>(), \
+      nullptr, key_scale.data_ptr<float>(), value_scale_ptr, \
       batch, q_len, kv_len, q_heads, kv_heads, \
       query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
       key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
@@ -7232,6 +7355,54 @@ torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
 #undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED
   hip_kernel_launch_check();
   return output;
+}
+
+torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor output,
+    torch::Tensor key_scale,
+    int tensor_layout,
+    int is_causal,
+    float sm_scale,
+    int64_t valid_kv_len) {
+  return qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
+      query, key, value, output, key_scale, torch::Tensor(),
+      tensor_layout, is_causal, sm_scale, valid_kv_len);
+}
+
+torch::Tensor qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor output,
+    torch::Tensor key_scale,
+    torch::Tensor value_scale,
+    int tensor_layout,
+    int is_causal,
+    float sm_scale,
+    int64_t valid_kv_len) {
+  return qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
+      query, key, value, output, key_scale, value_scale,
+      tensor_layout, is_causal, sm_scale, valid_kv_len);
+}
+
+torch::Tensor qk_int8_sv_f8_scaled_native_attn_gfx12(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor output,
+    torch::Tensor query_scale,
+    torch::Tensor key_scale,
+    torch::Tensor value_scale,
+    int tensor_layout,
+    int is_causal,
+    float sm_scale,
+    int64_t valid_kv_len) {
+  return qk_int8_sv_f16_d64_native_attn_gfx12_impl(
+      query, key, value, output, query_scale, key_scale, tensor_layout,
+      is_causal, sm_scale, valid_kv_len, value_scale);
 }
 
 torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12(

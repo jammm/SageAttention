@@ -158,6 +158,13 @@ def _pad_gfx12_nhd_sequence(
     return q_nhd, k_nhd, v_nhd
 
 
+_GFX12_FP8_VALUE_SCALE_MAX = 2.25
+
+
+def _gfx12_fp8_value_scale_hnd(v_hnd: torch.Tensor) -> torch.Tensor:
+    return v_hnd.abs().amax(dim=2).to(torch.float32).div(_GFX12_FP8_VALUE_SCALE_MAX).contiguous()
+
+
 def sageattn_qk_int8_pv_gfx12_native(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -191,35 +198,6 @@ def sageattn_qk_int8_pv_gfx12_native(
     value_dtype_normalized = value_dtype.lower()
     if value_dtype_normalized == "auto":
         value_dtype_normalized = "fp8"
-    if (
-        tensor_layout == "HND"
-        and value_dtype_normalized == "fp8"
-        and not smooth_k
-        and not return_lse
-        and q.dim() == 4
-        and k.dim() == 4
-        and v.dim() == 4
-        and q.is_cuda
-        and q.is_contiguous()
-        and k.is_contiguous()
-        and v.is_contiguous()
-        and q.dtype in (torch.float16, torch.bfloat16)
-        and q.dtype == k.dtype == v.dtype
-        and q.device == k.device == v.device
-        and q.size(-1) in (16, 64, 128)
-        and q.size(2) % 64 == 0
-        and k.size(2) % 64 == 0
-    ):
-        torch.cuda.set_device(v.device)
-        return gfx12_prepare_attn_hnd(
-            q,
-            k,
-            v,
-            int(is_causal),
-            1,
-            0,
-            float(sm_scale if sm_scale is not None else q.size(-1) ** -0.5),
-        )
     if (
         tensor_layout == "HND"
         and value_dtype_normalized == "fp16"
@@ -277,7 +255,8 @@ def sageattn_qk_int8_pv_gfx12_native(
         and k.is_contiguous()
         and v.is_contiguous()
         and q.size(-1) in (16, 64, 128)
-        and (value_dtype == "fp8" or q.size(-1) in (16, 64))
+        and value_dtype == "fp16"
+        and q.size(-1) in (16, 64)
         and q.size(2) % 64 == 0
         and k.size(2) % 64 == 0
     ):
@@ -356,26 +335,28 @@ def sageattn_qk_int8_pv_gfx12_native(
         _quant_fused.quant_per_block_int8_fuse_sub_mean_cuda(
             k_nhd, k_mean.squeeze(1), k_int8, k_scale, 64, 0
         )
-        if value_dtype == "fp8" and not is_causal and head_dim == 128:
-            value_native = gfx12_native.transpose_value_fp8_hnd(
-                v_nhd.transpose(1, 2).contiguous()
+        value_scale = None
+        if value_dtype == "fp8":
+            v_hnd_for_value = v_nhd.transpose(1, 2).contiguous()
+            value_scale = _gfx12_fp8_value_scale_hnd(v_hnd_for_value)
+            value_native = gfx12_native.transpose_value_fp8_scaled_hnd(
+                v_hnd_for_value, value_scale
             )
-        elif value_dtype == "fp8":
-            value_native = v_nhd.to(torch.float8_e4m3fn).view(torch.uint8)
         else:
-            value_native = v_nhd
+            value_native = v_nhd if input_dtype == torch.float16 else v_nhd.to(torch.float16)
         out = torch.empty(
             (q_nhd.size(0), q_out_len, q_nhd.size(2), q_nhd.size(3)),
             device=q_nhd.device,
             dtype=torch.float16,
         )
         if value_dtype == "fp8":
-            gfx12_native.qk_rawq_int8_sv_f8_native_attn(
+            gfx12_native.qk_rawq_int8_sv_f8_scaled_native_attn(
                 q_attn,
                 k_int8,
                 value_native,
                 out,
                 k_scale,
+                value_scale,
                 0,
                 int(is_causal),
                 float(sm_scale),
@@ -451,29 +432,46 @@ def sageattn_qk_int8_pv_gfx12_native(
     )
 
     if not smooth_k:
-        out = gfx12_prepare_attn_hnd(
-            q_hnd,
-            k_hnd,
-            v_hnd,
-            int(is_causal),
-            int(value_dtype == "fp8"),
-            int(use_raw_f16_value),
-            float(sm_scale),
-            kv_len,
-        )
+        if value_dtype == "fp8":
+            q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(
+                q_hnd, k_hnd, None, BLKQ=128, WARPQ=32, BLKK=64, tensor_layout="HND"
+            )
+            value_scale = _gfx12_fp8_value_scale_hnd(v_hnd)
+            value_native = gfx12_native.transpose_value_fp8_scaled_hnd(v_hnd, value_scale)
+            out = torch.empty_like(q_hnd, dtype=torch.float16)
+            gfx12_native.qk_int8_sv_f8_scaled_native_attn(
+                q_int8, k_int8, value_native, out, q_scale, k_scale, value_scale,
+                1, int(is_causal), float(sm_scale), kv_len
+            )
+        else:
+            out = gfx12_prepare_attn_hnd(
+                q_hnd,
+                k_hnd,
+                v_hnd,
+                int(is_causal),
+                0,
+                int(use_raw_f16_value),
+                float(sm_scale),
+                kv_len,
+            )
     else:
         q_int8, q_scale, k_int8, k_scale = per_warp_int8_cuda(
             q_hnd, k_hnd, k_mean, BLKQ=128, WARPQ=32, BLKK=64, tensor_layout="HND"
         )
         out = torch.empty_like(q_hnd, dtype=torch.float16)
         if value_dtype == "fp8":
-            value_native = gfx12_native.transpose_value_fp8_hnd(v_hnd)
+            value_scale = _gfx12_fp8_value_scale_hnd(v_hnd)
+            value_native = gfx12_native.transpose_value_fp8_scaled_hnd(v_hnd, value_scale)
+            gfx12_native.qk_int8_sv_f8_scaled_native_attn(
+                q_int8, k_int8, value_native, out, q_scale, k_scale, value_scale,
+                1, int(is_causal), float(sm_scale), kv_len
+            )
         else:
             value_native = gfx12_native.transpose_value_f16_hnd(v_hnd)
-        gfx12_native.qk_int8_sv_f16_d64_native_attn(
-            q_int8, k_int8, value_native, out, q_scale, k_scale,
-            1, int(is_causal), float(sm_scale), kv_len
-        )
+            gfx12_native.qk_int8_sv_f16_d64_native_attn(
+                q_int8, k_int8, value_native, out, q_scale, k_scale,
+                1, int(is_causal), float(sm_scale), kv_len
+            )
     out = out[..., :qo_len, :head_dim_og]
     if input_dtype == torch.bfloat16 and out.dtype != torch.bfloat16:
         out = gfx12_native.convert_f16_to_bf16(out.contiguous() if not out.is_contiguous() else out)
