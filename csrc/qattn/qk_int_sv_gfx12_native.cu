@@ -424,51 +424,6 @@ __device__ __forceinline__ void apply_tqk_causal_mask_pv_order(
   }
 }
 
-__device__ __forceinline__ float half_wave_max(float v) {
-#pragma unroll
-  for (int mask = 8; mask > 0; mask >>= 1) {
-    v = fmaxf(v, __shfl_xor(v, mask, 32));
-  }
-  return v;
-}
-
-__device__ __forceinline__ float half_wave_sum(float v) {
-#pragma unroll
-  for (int mask = 8; mask > 0; mask >>= 1) {
-    v += __shfl_xor(v, mask, 32);
-  }
-  return v;
-}
-
-__device__ __forceinline__ i32x2_vec pack_q_i8_wmma_a_regs(
-    const int8_t* __restrict__ q,
-    const int tensor_layout,
-    const int lane,
-    const int64_t b,
-    const int64_t h,
-    const int64_t q_start,
-    const int d_base,
-    const int64_t q_stride_b,
-    const int64_t q_stride_n,
-    const int64_t q_stride_h) {
-  i32x2_vec regs;
-  const int row = lane & 15;
-  const int k_base = 8 * (lane >> 4);
-#pragma unroll
-  for (int gpr = 0; gpr < 2; ++gpr) {
-    uint32_t packed = 0;
-#pragma unroll
-    for (int byte = 0; byte < 4; ++byte) {
-      const int d = d_base + k_base + 4 * gpr + byte;
-      const int64_t off = qkv_offset(
-          tensor_layout, b, h, q_start + row, d, q_stride_b, q_stride_n, q_stride_h);
-      packed |= static_cast<uint32_t>(static_cast<unsigned char>(q[off])) << (8 * byte);
-    }
-    regs[gpr] = static_cast<int32_t>(packed);
-  }
-  return regs;
-}
-
 template <typename QueryT, int HeadDim, bool HndContiguous>
 __device__ __forceinline__ i32x2_vec pack_quant_q_i8_wmma_b_regs(
     const QueryT* __restrict__ q,
@@ -500,26 +455,6 @@ __device__ __forceinline__ i32x2_vec pack_quant_q_i8_wmma_b_regs(
       tensor_layout, b, h, q_idx, d, q_stride_b, q_stride_n, q_stride_h);
   const uint4 raw = *reinterpret_cast<const uint4*>(q + q_off);
   const QueryT* values = reinterpret_cast<const QueryT*>(&raw);
-#pragma unroll
-  for (int gpr = 0; gpr < 2; ++gpr) {
-    uint32_t packed = 0;
-#pragma unroll
-    for (int byte = 0; byte < 4; ++byte) {
-      packed |= static_cast<uint32_t>(static_cast<unsigned char>(
-          float_to_int8_rn_gfx12(value_to_float(values[4 * gpr + byte]) * inv_q_scale)))
-          << (8 * byte);
-    }
-    regs[gpr] = static_cast<int32_t>(packed);
-  }
-  return regs;
-}
-
-template <typename QueryT>
-__device__ __forceinline__ i32x2_vec pack_quant_q_i8_wmma_b_regs_from_raw(
-    const uint4 raw,
-    const float inv_q_scale) {
-  const QueryT* values = reinterpret_cast<const QueryT*>(&raw);
-  i32x2_vec regs;
 #pragma unroll
   for (int gpr = 0; gpr < 2; ++gpr) {
     uint32_t packed = 0;
@@ -568,34 +503,6 @@ __device__ __forceinline__ i32x2_vec pack_q_i8_wmma_b_regs(
   return regs;
 }
 
-__device__ __forceinline__ i32x2_vec pack_q_i4_wmma_b_regs_k32(
-    const uint8_t* __restrict__ q,
-    const int lane,
-    const int64_t q_head_base,
-    const int64_t q_start,
-    const int64_t qo_len,
-    const int d_base,
-    const int64_t q_stride_n) {
-  i32x2_vec regs;
-  const int col = lane & 15;
-  const int k_base = 16 * (lane >> 4);
-  const int64_t q_idx = q_start + col;
-  if (q_idx >= qo_len) {
-#pragma unroll
-    for (int gpr = 0; gpr < 2; ++gpr) {
-      regs[gpr] = 0;
-    }
-    return regs;
-  }
-#pragma unroll
-  for (int gpr = 0; gpr < 2; ++gpr) {
-    const int64_t off =
-        q_head_base + q_idx * q_stride_n + ((d_base + k_base + 8 * gpr) >> 1);
-    regs[gpr] = *reinterpret_cast<const int32_t*>(q + off);
-  }
-  return regs;
-}
-
 template <int SharedHeadStride>
 __device__ __forceinline__ i32x2_vec pack_k_i8_wmma_b_regs_from_shared(
     const int8_t* __restrict__ k_tile,
@@ -634,43 +541,6 @@ __device__ __forceinline__ i32x2_vec pack_k_i8_wmma_b_regs_from_shared_pv_order(
   return regs;
 }
 
-template <bool PvOrderedQK, int BK, int SharedRows>
-__device__ __forceinline__ i32x2_vec pack_k_i8_wmma_b_regs_from_ck_shared(
-    const int8_t* __restrict__ k_tile,
-    const int lane,
-    const int col_tile,
-    const int d_tile) {
-  i32x2_vec regs;
-  const int col = lane & 15;
-  const int k_base = 8 * (lane >> 4);
-  const int row = col_tile * BK + (PvOrderedQK ? pv_k_order_for_acc_row(col) : col);
-  const int base = (d_tile * SharedRows + row) * BK + k_base;
-#pragma unroll
-  for (int gpr = 0; gpr < 2; ++gpr) {
-    regs[gpr] = *reinterpret_cast<const int32_t*>(k_tile + base + 4 * gpr);
-  }
-  return regs;
-}
-
-template <bool PvOrderedQK, int SharedPackedHeadStride>
-__device__ __forceinline__ i32x2_vec pack_k_i4_wmma_a_regs_k32_from_shared(
-    const uint8_t* __restrict__ k_tile,
-    const int lane,
-    const int col_tile,
-    const int d_base) {
-  i32x2_vec regs;
-  const int col = lane & 15;
-  const int row = col_tile * 16 + (PvOrderedQK ? pv_k_order_for_acc_row(col) : col);
-  const int k_base = 16 * (lane >> 4);
-#pragma unroll
-  for (int gpr = 0; gpr < 2; ++gpr) {
-    const int byte_d = (d_base + k_base + 8 * gpr) >> 1;
-    regs[gpr] = *reinterpret_cast<const int32_t*>(
-        k_tile + row * SharedPackedHeadStride + byte_d);
-  }
-  return regs;
-}
-
 template <int DTiles>
 __device__ __forceinline__ i32x2_vec pack_k_i8_wmma_b_regs_from_lane_major_global(
     const int8_t* __restrict__ k,
@@ -702,52 +572,6 @@ __device__ __forceinline__ i32x2_vec pack_k_i8_wmma_b_regs_from_lane_major_share
   regs[0] = static_cast<int32_t>(raw.x);
   regs[1] = static_cast<int32_t>(raw.y);
   return regs;
-}
-
-template <int ColTiles>
-__device__ __forceinline__ half8_vec make_p_regs_from_tqk_probs(
-    const __half (&prob_cache)[ColTiles][8],
-    const int col_tile,
-    const int lane) {
-  half8_vec regs;
-  const bool lane_upper = lane >= 16;
-  float local_values[8];
-  float peer_values[8];
-#pragma unroll
-  for (int i = 0; i < 8; ++i) {
-    local_values[i] = __half2float(prob_cache[col_tile][i]);
-    peer_values[i] = __shfl_xor(local_values[i], 16, 32);
-  }
-#pragma unroll
-  for (int elem = 0; elem < 8; ++elem) {
-    const int p_col = wmma_f16_k_for_lane_elem(lane, elem);
-    const int source_elem = p_col & 7;
-    const bool source_upper = p_col >= 8;
-    regs[elem] = static_cast<_Float16>(
-        source_upper == lane_upper ? local_values[source_elem] : peer_values[source_elem]);
-  }
-  return regs;
-}
-
-__device__ __forceinline__ float select8(const float8_vec values, const int idx) {
-  switch (idx) {
-    case 0:
-      return values[0];
-    case 1:
-      return values[1];
-    case 2:
-      return values[2];
-    case 3:
-      return values[3];
-    case 4:
-      return values[4];
-    case 5:
-      return values[5];
-    case 6:
-      return values[6];
-    default:
-      return values[7];
-  }
 }
 
 __device__ __forceinline__ int wmma_fp8_k_for_lane_byte(
@@ -819,76 +643,6 @@ __device__ __forceinline__ half8_vec make_p_regs_from_tqk_prob_regs(
     const uint16_t bits = static_cast<uint16_t>(packed >> (16 * (source_elem & 1)));
     regs[elem] = u16_bits_to_half(bits);
   }
-  return regs;
-}
-
-template <int ColTiles>
-__device__ __forceinline__ float shfl_prob_cache_row(
-    const __half (&prob_cache)[8][ColTiles],
-    const int row,
-    const int col_tile,
-    const int source_lane) {
-  float shuffled_rows[8];
-#pragma unroll
-  for (int r = 0; r < 8; ++r) {
-    shuffled_rows[r] = __shfl(__half2float(prob_cache[r][col_tile]), source_lane, 32);
-  }
-  return shuffled_rows[row];
-}
-
-template <int ColTiles>
-__device__ __forceinline__ half8_vec make_p_regs_from_acc_probs(
-    const __half (&prob_cache)[8][ColTiles],
-    const int col_tile,
-    const int lane) {
-  half8_vec regs;
-  const int p_row = lane & 15;
-  const int source_base_lane = (p_row >> 3) << 4;
-  const int source_row = p_row & 7;
-#pragma unroll
-  for (int elem = 0; elem < 8; ++elem) {
-    const int p_col = wmma_f16_k_for_lane_elem(lane, elem);
-    regs[elem] = static_cast<_Float16>(shfl_prob_cache_row(
-        prob_cache, source_row, col_tile, source_base_lane + p_col));
-  }
-  return regs;
-}
-
-template <int ColTiles>
-__device__ __forceinline__ float shfl_prob_cache_row_float(
-    const float (&prob_cache)[8][ColTiles],
-    const int row,
-    const int col_tile,
-    const int source_lane) {
-  float shuffled_rows[8];
-#pragma unroll
-  for (int r = 0; r < 8; ++r) {
-    shuffled_rows[r] = __shfl(prob_cache[r][col_tile], source_lane, 32);
-  }
-  return shuffled_rows[row];
-}
-
-template <int ColTiles>
-__device__ __forceinline__ i32x2_vec make_p_fp8_regs_from_acc_probs(
-    const float (&prob_cache)[8][ColTiles],
-    const int col_tile,
-    const int lane) {
-  float p_values[8];
-  const int p_row = lane & 15;
-  const int source_base_lane = (p_row >> 3) << 4;
-  const int source_row = p_row & 7;
-#pragma unroll
-  for (int elem = 0; elem < 8; ++elem) {
-    const int p_col = wmma_fp8_k_for_lane_byte(lane, elem >> 2, elem & 3);
-    p_values[elem] = shfl_prob_cache_row_float(
-        prob_cache, source_row, col_tile, source_base_lane + p_col);
-  }
-
-  i32x2_vec regs;
-  regs[0] = pack_f32x4_to_ocp_fp8(
-      p_values[0], p_values[1], p_values[2], p_values[3]);
-  regs[1] = pack_f32x4_to_ocp_fp8(
-      p_values[4], p_values[5], p_values[6], p_values[7]);
   return regs;
 }
 
@@ -1011,36 +765,6 @@ __device__ __forceinline__ float8_vec compute_tqk_score_regs(
 }
 
 template <int DTiles, int SharedHeadStride>
-__device__ __forceinline__ float8_vec compute_tqk_score_regs_raw(
-    const int8_t* __restrict__ k_tile,
-    const i32x2_vec (&q_regs)[DTiles],
-    const int lane,
-    const int col_tile,
-    const float score_scale) {
-  constexpr int BK = 16;
-  i32x8_vec score_acc;
-#pragma unroll
-  for (int elem = 0; elem < 8; ++elem) {
-    score_acc[elem] = 0;
-  }
-#pragma unroll
-  for (int dt = 0; dt < DTiles; ++dt) {
-    const i32x2_vec k_regs =
-        pack_k_i8_wmma_b_regs_from_shared<SharedHeadStride>(
-            k_tile, lane, col_tile, dt * BK);
-    score_acc = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
-        true, q_regs[dt], true, k_regs, score_acc, true);
-  }
-
-  float8_vec scores;
-#pragma unroll
-  for (int elem = 0; elem < 8; ++elem) {
-    scores[elem] = static_cast<float>(score_acc[elem]) * score_scale;
-  }
-  return scores;
-}
-
-template <int DTiles, int SharedHeadStride>
 __device__ __forceinline__ float8_vec compute_tqk_score_regs_raw_kq(
     const int8_t* __restrict__ k_tile,
     const i32x2_vec (&q_regs)[DTiles],
@@ -1152,89 +876,6 @@ __device__ __forceinline__ void compute_tqk_score_regs_raw_kq_2(
   }
 }
 
-template <bool PvOrderedQK, int DTiles, int BK, int SharedRows>
-__device__ __forceinline__ void compute_tqk_score_regs_raw_kq_2_ck_shared(
-    const int8_t* __restrict__ k_tile,
-    const i32x2_vec (&q_regs)[2][DTiles],
-    const int lane,
-    const int col_tile,
-    const float score_scale0,
-    const float score_scale1,
-    const bool do0,
-    const bool do1,
-    float8_vec& scores0,
-    float8_vec& scores1) {
-  i32x8_vec score_acc0;
-  i32x8_vec score_acc1;
-#pragma unroll
-  for (int elem = 0; elem < 8; ++elem) {
-    score_acc0[elem] = 0;
-    score_acc1[elem] = 0;
-  }
-#pragma unroll
-  for (int dt = 0; dt < DTiles; ++dt) {
-    const i32x2_vec k_regs =
-        pack_k_i8_wmma_b_regs_from_ck_shared<PvOrderedQK, BK, SharedRows>(
-            k_tile, lane, col_tile, dt);
-    if (do0) {
-      score_acc0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
-          true, k_regs, true, q_regs[0][dt], score_acc0, true);
-    }
-    if (do1) {
-      score_acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
-          true, k_regs, true, q_regs[1][dt], score_acc1, true);
-    }
-  }
-
-#pragma unroll
-  for (int elem = 0; elem < 8; ++elem) {
-    scores0[elem] = do0 ? static_cast<float>(score_acc0[elem]) * score_scale0 : -FLT_MAX * 0.5f;
-    scores1[elem] = do1 ? static_cast<float>(score_acc1[elem]) * score_scale1 : -FLT_MAX * 0.5f;
-  }
-}
-
-template <bool PvOrderedQK, int D32Tiles, int SharedPackedHeadStride>
-__device__ __forceinline__ void compute_tqk_score_regs_raw_i4_kq_2(
-    const uint8_t* __restrict__ k_tile,
-    const i32x2_vec (&q_regs)[2][D32Tiles],
-    const int lane,
-    const int col_tile,
-    const float score_scale0,
-    const float score_scale1,
-    const bool do0,
-    const bool do1,
-    float8_vec& scores0,
-    float8_vec& scores1) {
-  constexpr int BK32 = 32;
-  i32x8_vec score_acc0;
-  i32x8_vec score_acc1;
-#pragma unroll
-  for (int elem = 0; elem < 8; ++elem) {
-    score_acc0[elem] = 0;
-    score_acc1[elem] = 0;
-  }
-#pragma unroll
-  for (int dt = 0; dt < D32Tiles; ++dt) {
-    const i32x2_vec k_regs =
-        pack_k_i4_wmma_a_regs_k32_from_shared<PvOrderedQK, SharedPackedHeadStride>(
-            k_tile, lane, col_tile, dt * BK32);
-    if (do0) {
-      score_acc0 = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(
-          true, k_regs, true, q_regs[0][dt], score_acc0, true);
-    }
-    if (do1) {
-      score_acc1 = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(
-          true, k_regs, true, q_regs[1][dt], score_acc1, true);
-    }
-  }
-
-#pragma unroll
-  for (int elem = 0; elem < 8; ++elem) {
-    scores0[elem] = do0 ? static_cast<float>(score_acc0[elem]) * score_scale0 : -FLT_MAX * 0.5f;
-    scores1[elem] = do1 ? static_cast<float>(score_acc1[elem]) * score_scale1 : -FLT_MAX * 0.5f;
-  }
-}
-
 template <int DTiles>
 __device__ __forceinline__ void compute_tqk_score_regs_raw_kq_2_lane_key(
     const int8_t* __restrict__ k,
@@ -1318,21 +959,6 @@ __device__ __forceinline__ void compute_tqk_score_regs_raw_kq_2_lane_shared_key(
     scores0[elem] = do0 ? static_cast<float>(score_acc0[elem]) * score_scale0 : -FLT_MAX * 0.5f;
     scores1[elem] = do1 ? static_cast<float>(score_acc1[elem]) * score_scale1 : -FLT_MAX * 0.5f;
   }
-}
-
-__device__ __forceinline__ float8_vec transpose_raw_qk_scores_to_tqk(
-    const float8_vec raw_scores,
-    const int lane) {
-  float8_vec scores;
-  const int row = lane & 15;
-  const int source_row = row & 7;
-  const int source_lane_base = (row >> 3) << 4;
-  const int col_base = (lane >> 4) << 3;
-#pragma unroll
-  for (int elem = 0; elem < 8; ++elem) {
-    scores[elem] = __shfl(raw_scores[source_row], source_lane_base + col_base + elem, 32);
-  }
-  return scores;
 }
 
 template <int SharedHeadStride>
@@ -1954,21 +1580,11 @@ template <int BlockCols,
           typename KeyT = int8_t,
           bool QuantizeKey = false,
           bool PvOrderedQK = false,
-          bool DirectGlobalValue = false,
           bool LaneMajorValue = false,
           bool StreamColTiles = false,
-          bool PrepackedLaneMajorValue = false,
           bool LaneMajorKey = false,
-          bool PrepackedLaneMajorKey = false,
-          bool UseInt4QK = false,
           int HeadDim = 64,
-          bool DelayValueStaging = false,
-          bool ReverseCausalKv = false,
-          bool CacheQuantQuery = false,
-          bool NoProbCache = false,
-          bool CkKeySharedLayout = false,
-          bool FlatCausalSchedule = false,
-          bool PersistentCausalSchedule = false>
+          bool FlatCausalSchedule = false>
 SAGEATTN_NATIVE_2Q_WAVES_PER_EU(HeadDim, IsCausal) __global__
 SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2q_kernel(
     const QueryT* __restrict__ q,
@@ -2007,37 +1623,22 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
   constexpr int RowsPerWave = 32;
   constexpr int QGroups = 2;
   constexpr int BK = 16;
-  constexpr int QKBK = UseInt4QK ? 32 : BK;
   constexpr int BC = BlockCols;
   constexpr int Threads = BlockRows;
   constexpr int DTiles = HeadDim / BK;
-  constexpr int QKDTiles = HeadDim / QKBK;
   constexpr int ColTiles = BC / BK;
   constexpr int SharedHeadStride = HeadDim + 16;
-  constexpr int SharedQKHeadStride = UseInt4QK ? (HeadDim / 2 + 8) : SharedHeadStride;
+  constexpr int SharedQKHeadStride = SharedHeadStride;
   constexpr bool UseTransposedValueLayout = ValueTransposed || TransposeValueOnLoad;
-  constexpr bool UsePrepackedLaneMajorValue =
-      PrepackedLaneMajorValue && !DirectGlobalValue && HndContiguous && ValueTransposed;
-  constexpr bool UsePrepackedLaneMajorKey =
-      PrepackedLaneMajorKey && !QuantizeKey && HndContiguous && BlockCols == 64 && PvOrderedQK;
   constexpr bool UseLaneMajorKey =
-      LaneMajorKey && !UsePrepackedLaneMajorKey && !QuantizeKey && HndContiguous &&
-      BlockCols == 64 && PvOrderedQK;
-  constexpr bool UseCkKeySharedLayout =
-      CkKeySharedLayout && !UsePrepackedLaneMajorKey && !UseLaneMajorKey &&
-      !QuantizeKey && HndContiguous && BlockCols == 64 && HeadDim == 64 &&
-      !UseInt4QK;
+      LaneMajorKey && !QuantizeKey && HndContiguous && BlockCols == 64 && PvOrderedQK;
   constexpr bool UseLaneMajorValue =
-      LaneMajorValue && !UsePrepackedLaneMajorValue && !DirectGlobalValue && HndContiguous &&
+      LaneMajorValue && HndContiguous &&
       (ValueTransposed || TransposeValueOnLoad);
-  constexpr bool StageValueInShared =
-      !DirectGlobalValue && !UseLaneMajorValue && !UsePrepackedLaneMajorValue;
-  constexpr bool UsesTileSharedMemory =
-      !UsePrepackedLaneMajorKey || StageValueInShared || UseLaneMajorValue;
-  constexpr bool UsesKeySharedMemory = !UsePrepackedLaneMajorKey || UseLaneMajorKey;
+  constexpr bool StageValueInShared = !UseLaneMajorValue;
+  constexpr bool UsesTileSharedMemory = true;
+  constexpr bool UsesKeySharedMemory = true;
   constexpr bool UsesValueSharedMemory = StageValueInShared || UseLaneMajorValue;
-  constexpr bool UseDelayedValueStaging =
-      DelayValueStaging && BlockCols <= 128 && !StreamColTiles;
   constexpr int SharedValueRows =
       StageValueInShared ? (UseTransposedValueLayout ? HeadDim : BC) : 1;
   constexpr int SharedValueStride =
@@ -2056,48 +1657,16 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                 "direct fp16 Q quantization currently requires contiguous HND tensors.");
   static_assert(!QuantizeKey || (HndContiguous && BlockCols == 64),
                 "direct fp16 K quantization currently requires contiguous HND BC64 tensors.");
-  static_assert(!DirectGlobalValue ||
-                    (HndContiguous && (ValueTransposed || TransposeValueOnLoad)),
-                "direct global fp16 value path requires contiguous HND values.");
   static_assert(!LaneMajorValue ||
-                    (!DirectGlobalValue && HndContiguous &&
-                     (ValueTransposed || TransposeValueOnLoad)),
+                    (HndContiguous && (ValueTransposed || TransposeValueOnLoad)),
                 "lane-major fp16 value staging requires contiguous HND values.");
-  static_assert(!PrepackedLaneMajorValue ||
-                    (!DirectGlobalValue && HndContiguous && ValueTransposed &&
-                     BlockCols == 64),
-                "prepacked lane-major fp16 values require contiguous HND BC64 values.");
-  static_assert(!PrepackedLaneMajorKey ||
-                    (!QuantizeKey && HndContiguous && BlockCols == 64 && PvOrderedQK),
-                "prepacked lane-major fp16 keys require prepared HND BC64 PvOrderedQK.");
   static_assert(!LaneMajorKey ||
                      (!QuantizeKey && HndContiguous && BlockCols == 64 && PvOrderedQK),
                 "lane-major fp16 key staging requires prepared HND BC64 PvOrderedQK.");
-  static_assert(!CkKeySharedLayout ||
-                    (!UsePrepackedLaneMajorKey && !UseLaneMajorKey && !QuantizeKey &&
-                     HndContiguous && BlockCols == 64 && HeadDim == 64 && !UseInt4QK),
-                "CK-style key shared layout is specialized for prepared HND D64 BC64 tensors.");
   static_assert(!StreamColTiles || (BlockCols <= 128 && (QuantizeQuery || HndContiguous)),
                 "streaming col-tile softmax is specialized for raw/quantized QK.");
-  static_assert(!PersistentCausalSchedule || IsCausal,
-                "persistent q scheduling is causal-only");
-  static_assert(!(FlatCausalSchedule && PersistentCausalSchedule),
-                "flat and persistent q scheduling are mutually exclusive");
-  static_assert(!UseInt4QK ||
-                     (HndContiguous && BlockCols == 64 && !QuantizeQuery && !QuantizeKey &&
-                      !UsePrepackedLaneMajorKey && !UseLaneMajorKey &&
-                      HeadDim == 64 &&
-                      std::is_same<QueryT, uint8_t>::value &&
-                      std::is_same<KeyT, uint8_t>::value),
-                "packed int4 QK is specialized for prepared HND D64 BC64 tensors.");
-
-  using SharedQKStorageT = typename std::conditional<UseInt4QK, uint8_t, int8_t>::type;
-  __shared__ SharedQKStorageT k_tile[(UsePrepackedLaneMajorKey || UseLaneMajorKey ||
-                                      UseCkKeySharedLayout) ? 1 : BC]
-                                  [SharedQKHeadStride];
-  __shared__ int8_t k_ck_tile[UseCkKeySharedLayout ? DTiles : 1]
-                             [UseCkKeySharedLayout ? (BC + 1) : 1]
-                             [UseCkKeySharedLayout ? BK : 1];
+  __shared__ int8_t k_tile[UseLaneMajorKey ? 1 : BC]
+                        [SharedQKHeadStride];
   __shared__ uint2 k_lane_tile[UseLaneMajorKey ? (ColTiles * DTiles * 32) : 1];
   __shared__ __half v_tile[SharedValueRows][SharedValueStride];
   __shared__ uint4 v_lane_tile[UseLaneMajorValue ? (ColTiles * DTiles * 32) : 1];
@@ -2110,23 +1679,11 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
   const int col = lane & 15;
   const int64_t q_block_count = (qo_len + BR - 1) / BR;
   const int64_t hb_count = num_qo_heads * batch_size;
-  const int64_t persistent_tile_count = q_block_count * hb_count;
-  const int64_t persistent_stride = static_cast<int64_t>(gridDim.x);
-  for (int64_t persistent_tile = static_cast<int64_t>(blockIdx.x);;
-       persistent_tile += persistent_stride) {
+  for (;;) {
     int64_t q_block = static_cast<int64_t>(blockIdx.x);
     int64_t hq = blockIdx.y;
     int64_t b = blockIdx.z;
-    if constexpr (PersistentCausalSchedule) {
-      const int64_t linear_tile = persistent_tile;
-      if (linear_tile >= persistent_tile_count) {
-        return;
-      }
-      const int64_t hb = linear_tile % hb_count;
-      q_block = linear_tile / hb_count;
-      hq = hb % num_qo_heads;
-      b = hb / num_qo_heads;
-    } else if constexpr (FlatCausalSchedule) {
+    if constexpr (FlatCausalSchedule) {
       static_assert(IsCausal, "flat q scheduling is causal-only");
       const int64_t hb = static_cast<int64_t>(blockIdx.x) % hb_count;
       q_block = static_cast<int64_t>(blockIdx.x) / hb_count;
@@ -2155,82 +1712,40 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
   using FragScoreT = rocwmma::fragment<rocwmma::accumulator, RM, BK, BK, int32_t>;
   constexpr bool UseRawPreparedQ = !QuantizeQuery && HndContiguous;
 
-  i32x2_vec q_regs[QGroups][QKDTiles];
+  i32x2_vec q_regs[QGroups][DTiles];
   if constexpr (QuantizeQuery) {
-    if constexpr (CacheQuantQuery && HeadDim == 64 && HndContiguous) {
-      uint4 q_raw_cache[QGroups][DTiles];
-      float local_q_amax = 0.0000001f;
-      const int row = lane & 15;
-      const int k_base = 8 * (lane >> 4);
+    constexpr int QPackElems = 8;
+    constexpr int QPacksPerWave = (RowsPerWave * HeadDim) / QPackElems;
+    const int local_q_row_base = wave * RowsPerWave;
+    float local_q_amax = 0.0000001f;
+    for (int pack = lane; pack < QPacksPerWave; pack += 32) {
+      const int elem_base = pack * QPackElems;
+      const int row = elem_base / HeadDim;
+      const int d = elem_base - row * HeadDim;
+      const int64_t q_idx = q_base + local_q_row_base + row;
+      if (q_idx < qo_len) {
+        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+            tensor_layout, b, hq, q_idx, d, q_stride_b, q_stride_n, q_stride_h);
+        const uint4 raw = *reinterpret_cast<const uint4*>(q + q_off);
+        const QueryT* values = reinterpret_cast<const QueryT*>(&raw);
 #pragma unroll
-      for (int qg = 0; qg < QGroups; ++qg) {
-        const int64_t q_idx = q_start[qg] + row;
-#pragma unroll
-        for (int dt = 0; dt < DTiles; ++dt) {
-          uint4 raw;
-          raw.x = 0;
-          raw.y = 0;
-          raw.z = 0;
-          raw.w = 0;
-          if (q_idx < qo_len) {
-            const int d = dt * BK + k_base;
-            const int64_t q_off = q_head_base + q_idx * HeadDim + d;
-            raw = *reinterpret_cast<const uint4*>(q + q_off);
-            const QueryT* values = reinterpret_cast<const QueryT*>(&raw);
-#pragma unroll
-            for (int i = 0; i < 8; ++i) {
-              local_q_amax = fmaxf(local_q_amax, fabsf(value_to_float(values[i])));
-            }
-          }
-          q_raw_cache[qg][dt] = raw;
+        for (int i = 0; i < QPackElems; ++i) {
+          local_q_amax = fmaxf(local_q_amax, fabsf(value_to_float(values[i])));
         }
       }
-      local_q_amax = vllm::warpReduceMax(local_q_amax);
-      const float q_scale_local = __shfl(local_q_amax, 0, 32) / 127.0f;
-      const float inv_q_scale = 127.0f / __shfl(local_q_amax, 0, 32);
+    }
+    local_q_amax = vllm::warpReduceMax(local_q_amax);
+    const float q_scale_local = __shfl(local_q_amax, 0, 32) / 127.0f;
+    const float inv_q_scale = 127.0f / __shfl(local_q_amax, 0, 32);
 #pragma unroll
-      for (int qg = 0; qg < QGroups; ++qg) {
-        qs[qg] = q_scale_local * sm_scale * kLog2e;
+    for (int qg = 0; qg < QGroups; ++qg) {
+      qs[qg] = q_scale_local * sm_scale * kLog2e;
+      const int64_t qg_start = q_start[qg];
 #pragma unroll
-        for (int dt = 0; dt < DTiles; ++dt) {
-          q_regs[qg][dt] =
-              pack_quant_q_i8_wmma_b_regs_from_raw<QueryT>(q_raw_cache[qg][dt], inv_q_scale);
-        }
-      }
-    } else {
-      constexpr int QPackElems = 8;
-      constexpr int QPacksPerWave = (RowsPerWave * HeadDim) / QPackElems;
-      const int local_q_row_base = wave * RowsPerWave;
-      float local_q_amax = 0.0000001f;
-      for (int pack = lane; pack < QPacksPerWave; pack += 32) {
-        const int elem_base = pack * QPackElems;
-        const int row = elem_base / HeadDim;
-        const int d = elem_base - row * HeadDim;
-        const int64_t q_idx = q_base + local_q_row_base + row;
-        if (q_idx < qo_len) {
-          const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
-              tensor_layout, b, hq, q_idx, d, q_stride_b, q_stride_n, q_stride_h);
-          const uint4 raw = *reinterpret_cast<const uint4*>(q + q_off);
-          const QueryT* values = reinterpret_cast<const QueryT*>(&raw);
-#pragma unroll
-          for (int i = 0; i < QPackElems; ++i) {
-            local_q_amax = fmaxf(local_q_amax, fabsf(value_to_float(values[i])));
-          }
-        }
-      }
-      local_q_amax = vllm::warpReduceMax(local_q_amax);
-      const float q_scale_local = __shfl(local_q_amax, 0, 32) / 127.0f;
-      const float inv_q_scale = 127.0f / __shfl(local_q_amax, 0, 32);
-#pragma unroll
-      for (int qg = 0; qg < QGroups; ++qg) {
-        qs[qg] = q_scale_local * sm_scale * kLog2e;
-        const int64_t qg_start = q_start[qg];
-#pragma unroll
-        for (int dt = 0; dt < DTiles; ++dt) {
-          q_regs[qg][dt] = pack_quant_q_i8_wmma_b_regs<QueryT, HeadDim, HndContiguous>(
-              q, tensor_layout, lane, b, hq, qg_start, qo_len, dt * BK,
-              q_stride_b, q_stride_n, q_stride_h, inv_q_scale);
-        }
+      for (int dt = 0; dt < DTiles; ++dt) {
+        q_regs[qg][dt] = pack_quant_q_i8_wmma_b_regs<QueryT, HeadDim, HndContiguous>(
+            q, tensor_layout, lane, b, hq, qg_start, qo_len, dt * BK,
+            q_stride_b, q_stride_n, q_stride_h, inv_q_scale);
       }
     }
   } else {
@@ -2244,16 +1759,10 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
 #pragma unroll
       for (int qg = 0; qg < QGroups; ++qg) {
 #pragma unroll
-        for (int dt = 0; dt < QKDTiles; ++dt) {
-          if constexpr (UseInt4QK) {
-            q_regs[qg][dt] = pack_q_i4_wmma_b_regs_k32(
-                reinterpret_cast<const uint8_t*>(q), lane, q_head_base, q_start[qg],
-                qo_len, dt * QKBK, q_stride_n);
-          } else {
-            q_regs[qg][dt] = pack_q_i8_wmma_b_regs<HeadDim, HndContiguous>(
-                reinterpret_cast<const int8_t*>(q), tensor_layout, lane, b, hq, q_start[qg],
-                qo_len, dt * BK, q_stride_b, q_stride_n, q_stride_h);
-          }
+        for (int dt = 0; dt < DTiles; ++dt) {
+          q_regs[qg][dt] = pack_q_i8_wmma_b_regs<HeadDim, HndContiguous>(
+              reinterpret_cast<const int8_t*>(q), tensor_layout, lane, b, hq, q_start[qg],
+              qo_len, dt * BK, q_stride_b, q_stride_n, q_stride_h);
         }
       }
     }
@@ -2297,7 +1806,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
   const int64_t kv_limit = IsCausal && (q_base + BR) < kv_len ? q_base + BR : kv_len;
   auto process_kv_tile = [&](const int64_t kb_base, auto apply_causal_mask_tag) {
     constexpr int KVecBytes = 16;
-    constexpr int KBytesPerRow = UseInt4QK ? (HeadDim / 2) : HeadDim;
+    constexpr int KBytesPerRow = HeadDim;
     constexpr int KVecsPerRow = KBytesPerRow / KVecBytes;
     float k_scale_tile = 1.0f;
     if constexpr (QuantizeKey) {
@@ -2359,22 +1868,12 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
         const int64_t k_off = k_head_base + (kb_base + row) * HeadDim + d;
         k_lane_tile[idx] = *reinterpret_cast<const uint2*>(k + k_off);
       }
-    } else if constexpr (UseCkKeySharedLayout) {
-      for (int vec = tid; vec < BC * KVecsPerRow; vec += Threads) {
-        const int n = vec / KVecsPerRow;
-        const int d = (vec - n * KVecsPerRow) * KVecBytes;
-        const int64_t k_off = k_head_base + (kb_base + n) * HeadDim + d;
-        *reinterpret_cast<uint4*>(&k_ck_tile[d / BK][n][0]) =
-            *reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(k) + k_off);
-      }
-    } else if constexpr (!UsePrepackedLaneMajorKey) {
+    } else {
       for (int vec = tid; vec < BC * KVecsPerRow; vec += Threads) {
         const int n = vec / KVecsPerRow;
         const int d = (vec - n * KVecsPerRow) * KVecBytes;
         int64_t k_off;
-        if constexpr (UseInt4QK) {
-          k_off = k_head_base + (kb_base + n) * k_stride_n + d;
-        } else if constexpr (HndContiguous) {
+        if constexpr (HndContiguous) {
           k_off = k_head_base + (kb_base + n) * HeadDim + d;
         } else {
           k_off = qkv_offset(
@@ -2477,10 +1976,8 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
       }
     }
     };
-    if constexpr (!UseDelayedValueStaging) {
-      stage_value_tile();
-    }
-    if constexpr (UsesKeySharedMemory || (!UseDelayedValueStaging && UsesValueSharedMemory)) {
+    stage_value_tile();
+    if constexpr (UsesKeySharedMemory || UsesValueSharedMemory) {
       __syncthreads();
     }
     SAGEATTN_F16_SCHED_BARRIER(0);
@@ -2522,28 +2019,9 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
               k_scale_local =
                   k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
             }
-            if constexpr (UsePrepackedLaneMajorKey) {
-              compute_tqk_score_regs_raw_kq_2_lane_key<DTiles>(
-                  reinterpret_cast<const int8_t*>(k), k_head_base, k_stride_n * 64,
-                  kb_base, q_regs, lane, col_tile,
-                  qs[0] * k_scale_local, qs[1] * k_scale_local,
-                  !fully_future0, !fully_future1,
-                  scores0[gc], scores1[gc]);
-            } else if constexpr (UseLaneMajorKey) {
+            if constexpr (UseLaneMajorKey) {
               compute_tqk_score_regs_raw_kq_2_lane_shared_key<DTiles>(
                   k_lane_tile, q_regs, lane, col_tile,
-                  qs[0] * k_scale_local, qs[1] * k_scale_local,
-                  !fully_future0, !fully_future1,
-                  scores0[gc], scores1[gc]);
-            } else if constexpr (UseCkKeySharedLayout) {
-              compute_tqk_score_regs_raw_kq_2_ck_shared<PvOrderedQK, DTiles, BK, BC + 1>(
-                  &k_ck_tile[0][0][0], q_regs, lane, col_tile,
-                  qs[0] * k_scale_local, qs[1] * k_scale_local,
-                  !fully_future0, !fully_future1,
-                  scores0[gc], scores1[gc]);
-            } else if constexpr (UseInt4QK) {
-              compute_tqk_score_regs_raw_i4_kq_2<PvOrderedQK, QKDTiles, SharedQKHeadStride>(
-                  reinterpret_cast<const uint8_t*>(&k_tile[0][0]), q_regs, lane, col_tile,
                   qs[0] * k_scale_local, qs[1] * k_scale_local,
                   !fully_future0, !fully_future1,
                   scores0[gc], scores1[gc]);
@@ -2658,20 +2136,9 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
 #pragma unroll
             for (int dt = 0; dt < DTiles; ++dt) {
               half8_vec v_regs;
-              if constexpr (UsePrepackedLaneMajorValue) {
-                v_regs = make_v_regs_from_lane_major_global<DTiles>(
-                    v, v_head_base, v_stride_n, kb_base, col_tile, dt, lane);
-              } else if constexpr (UseLaneMajorValue) {
+              if constexpr (UseLaneMajorValue) {
                 v_regs = make_v_regs_from_lane_major_shared<DTiles>(
                     v_lane_tile, col_tile, dt, lane);
-              } else if constexpr (DirectGlobalValue) {
-                if constexpr (ValueTransposed) {
-                  v_regs = make_v_regs_from_transposed_global(
-                      v, v_head_base, v_stride_n, kb_base, col_tile, dt, lane);
-                } else {
-                  v_regs = make_v_regs_from_hnd_global(
-                      v, v_head_base, v_stride_n, kb_base, col_tile, dt, lane);
-                }
               } else if constexpr (UseTransposedValueLayout) {
                 v_regs = make_v_regs_from_transposed_shared<SharedValueStride>(
                     &v_tile[0][0], col_tile, dt, lane);
@@ -2707,256 +2174,6 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
         }
         return;
       }
-      if constexpr ((QuantizeQuery || UseRawPreparedQ) && NoProbCache) {
-        float8_vec score_cache[QGroups][ColTiles];
-        float local_max[QGroups];
-#pragma unroll
-        for (int qg = 0; qg < QGroups; ++qg) {
-          local_max[qg] = -FLT_MAX * 0.5f;
-        }
-#pragma unroll
-        for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
-          const int64_t k_col_start = kb_base + col_tile * BK;
-          const bool fully_future0 =
-              ApplyCausalMask && k_col_start >= q_start[0] + RM;
-          const bool fully_future1 =
-              ApplyCausalMask && k_col_start >= q_start[1] + RM;
-          float8_vec scores0;
-          float8_vec scores1;
-          if (fully_future0 && fully_future1) {
-#pragma unroll
-            for (int elem = 0; elem < 8; ++elem) {
-              scores0[elem] = -FLT_MAX * 0.5f;
-              scores1[elem] = -FLT_MAX * 0.5f;
-            }
-          } else {
-            float k_scale_local = prepared_k_scale_tile;
-            if constexpr (!QuantizeKey && BC > 64) {
-              const int k_scale_idx = k_scale_col_per_warp(k_col_start);
-              k_scale_local =
-                  k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
-            }
-            if constexpr (UsePrepackedLaneMajorKey) {
-              compute_tqk_score_regs_raw_kq_2_lane_key<DTiles>(
-                  reinterpret_cast<const int8_t*>(k), k_head_base, k_stride_n * 64,
-                  kb_base, q_regs, lane, col_tile,
-                  qs[0] * k_scale_local, qs[1] * k_scale_local,
-                  !fully_future0, !fully_future1, scores0, scores1);
-            } else if constexpr (UseLaneMajorKey) {
-              compute_tqk_score_regs_raw_kq_2_lane_shared_key<DTiles>(
-                  k_lane_tile, q_regs, lane, col_tile,
-                  qs[0] * k_scale_local, qs[1] * k_scale_local,
-                  !fully_future0, !fully_future1, scores0, scores1);
-            } else if constexpr (UseCkKeySharedLayout) {
-              compute_tqk_score_regs_raw_kq_2_ck_shared<PvOrderedQK, DTiles, BK, BC + 1>(
-                  &k_ck_tile[0][0][0], q_regs, lane, col_tile,
-                  qs[0] * k_scale_local, qs[1] * k_scale_local,
-                  !fully_future0, !fully_future1, scores0, scores1);
-            } else if constexpr (UseInt4QK) {
-              compute_tqk_score_regs_raw_i4_kq_2<PvOrderedQK, QKDTiles, SharedQKHeadStride>(
-                  reinterpret_cast<const uint8_t*>(&k_tile[0][0]), q_regs, lane, col_tile,
-                  qs[0] * k_scale_local, qs[1] * k_scale_local,
-                  !fully_future0, !fully_future1, scores0, scores1);
-            } else {
-              compute_tqk_score_regs_raw_kq_2<PvOrderedQK, DTiles, SharedQKHeadStride>(
-                  &k_tile[0][0], q_regs, lane, col_tile,
-                  qs[0] * k_scale_local, qs[1] * k_scale_local,
-                  !fully_future0, !fully_future1, scores0, scores1);
-            }
-            if constexpr (ApplyCausalMask) {
-              if (fully_future0) {
-#pragma unroll
-                for (int elem = 0; elem < 8; ++elem) {
-                  scores0[elem] = -FLT_MAX * 0.5f;
-                }
-              } else if (k_col_start + BK > q_start[0]) {
-                if constexpr (PvOrderedQK) {
-                  apply_tqk_causal_mask_pv_order<true>(
-                      scores0, static_cast<int>(q_start[0]), static_cast<int>(kb_base),
-                      col_tile, lane);
-                } else {
-                  apply_tqk_causal_mask<true>(
-                      scores0, static_cast<int>(q_start[0]), static_cast<int>(kb_base),
-                      col_tile, lane);
-                }
-              }
-              if (fully_future1) {
-#pragma unroll
-                for (int elem = 0; elem < 8; ++elem) {
-                  scores1[elem] = -FLT_MAX * 0.5f;
-                }
-              } else if (k_col_start + BK > q_start[1]) {
-                if constexpr (PvOrderedQK) {
-                  apply_tqk_causal_mask_pv_order<true>(
-                      scores1, static_cast<int>(q_start[1]), static_cast<int>(kb_base),
-                      col_tile, lane);
-                } else {
-                  apply_tqk_causal_mask<true>(
-                      scores1, static_cast<int>(q_start[1]), static_cast<int>(kb_base),
-                      col_tile, lane);
-                }
-              }
-            }
-          }
-          score_cache[0][col_tile] = scores0;
-          score_cache[1][col_tile] = scores1;
-#pragma unroll
-          for (int elem = 0; elem < 8; ++elem) {
-            local_max[0] = fmaxf(local_max[0], scores0[elem]);
-            local_max[1] = fmaxf(local_max[1], scores1[elem]);
-          }
-        }
-#pragma unroll
-        for (int qg = 0; qg < QGroups; ++qg) {
-          const float tile_max = fmaxf(local_max[qg], __shfl_xor(local_max[qg], 16, 32));
-          const float old_m = m[qg];
-          const float new_m = fmaxf(old_m, tile_max);
-          const float alpha = l[qg] == 0.0f ? 0.0f : fast_exp2(old_m - new_m);
-          m[qg] = new_m;
-          l[qg] *= alpha;
-
-          float8_vec alpha_rows;
-#pragma unroll
-          for (int elem = 0; elem < 8; ++elem) {
-            alpha_rows[elem] = __shfl(alpha, row_base + elem, 32);
-          }
-
-#pragma unroll
-          for (int dt = 0; dt < DTiles; ++dt) {
-#pragma unroll
-            for (int elem = 0; elem < 8; ++elem) {
-              out_frag[qg][dt][elem] *= alpha_rows[elem];
-            }
-          }
-        }
-
-        if constexpr (UseDelayedValueStaging) {
-          SAGEATTN_F16_SCHED_BARRIER(0x7f);
-          stage_value_tile();
-          if constexpr (UsesValueSharedMemory) {
-            __syncthreads();
-          }
-          SAGEATTN_F16_SCHED_BARRIER(0);
-        }
-        SAGEATTN_F16_SCHED_BARRIER(0);
-
-        float local_sum[QGroups];
-#pragma unroll
-        for (int qg = 0; qg < QGroups; ++qg) {
-          local_sum[qg] = 0.0f;
-        }
-#pragma unroll
-        for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
-          const int64_t k_col_start = kb_base + col_tile * BK;
-          const bool fully_future0 =
-              ApplyCausalMask && k_col_start >= q_start[0] + RM;
-          const bool fully_future1 =
-              ApplyCausalMask && k_col_start >= q_start[1] + RM;
-          if (fully_future0 && fully_future1) {
-            continue;
-          }
-          half8_vec p_regs0;
-          half8_vec p_regs1;
-          if (!fully_future0) {
-            half8_vec prob_values;
-#pragma unroll
-            for (int elem = 0; elem < 8; ++elem) {
-              const float prob =
-                  fast_exp2(score_cache[0][col_tile][elem] - m[0] + kF16SoftmaxOffset);
-              local_sum[0] += prob;
-              prob_values[elem] = static_cast<_Float16>(prob);
-            }
-            if constexpr (PvOrderedQK) {
-              p_regs0 = prob_values;
-            } else {
-              p_regs0 = make_p_regs_from_tqk_prob_regs(prob_values, lane);
-            }
-          }
-          if (!fully_future1) {
-            half8_vec prob_values;
-#pragma unroll
-            for (int elem = 0; elem < 8; ++elem) {
-              const float prob =
-                  fast_exp2(score_cache[1][col_tile][elem] - m[1] + kF16SoftmaxOffset);
-              local_sum[1] += prob;
-              prob_values[elem] = static_cast<_Float16>(prob);
-            }
-            if constexpr (PvOrderedQK) {
-              p_regs1 = prob_values;
-            } else {
-              p_regs1 = make_p_regs_from_tqk_prob_regs(prob_values, lane);
-            }
-          }
-#pragma unroll
-          for (int dt = 0; dt < DTiles; ++dt) {
-            half8_vec v_regs;
-            if constexpr (UsePrepackedLaneMajorValue) {
-              v_regs = make_v_regs_from_lane_major_global<DTiles>(
-                  v, v_head_base, v_stride_n, kb_base, col_tile, dt, lane);
-            } else if constexpr (UseLaneMajorValue) {
-              v_regs = make_v_regs_from_lane_major_shared<DTiles>(
-                  v_lane_tile, col_tile, dt, lane);
-            } else if constexpr (DirectGlobalValue) {
-              if constexpr (ValueTransposed) {
-                v_regs = make_v_regs_from_transposed_global(
-                    v, v_head_base, v_stride_n, kb_base, col_tile, dt, lane);
-              } else {
-                v_regs = make_v_regs_from_hnd_global(
-                    v, v_head_base, v_stride_n, kb_base, col_tile, dt, lane);
-              }
-            } else if constexpr (UseTransposedValueLayout) {
-              v_regs = make_v_regs_from_transposed_shared<SharedValueStride>(
-                  &v_tile[0][0], col_tile, dt, lane);
-            } else {
-              v_regs = make_v_regs_from_shared<SharedValueStride>(
-                  &v_tile[0][0], col_tile, dt, lane);
-            }
-            if (!fully_future0) {
-              PvAccumVec acc0;
-#pragma unroll
-              for (int elem = 0; elem < 8; ++elem) {
-                acc0[elem] = out_frag[0][dt][elem];
-              }
-              PvAccumVec pv_acc0;
-              if constexpr (F16PvAccum) {
-                pv_acc0 =
-                    __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(p_regs0, v_regs, acc0);
-              } else {
-                pv_acc0 =
-                    __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_regs0, v_regs, acc0);
-              }
-#pragma unroll
-              for (int elem = 0; elem < 8; ++elem) {
-                out_frag[0][dt][elem] = pv_acc0[elem];
-              }
-            }
-            if (!fully_future1) {
-              PvAccumVec acc1;
-#pragma unroll
-              for (int elem = 0; elem < 8; ++elem) {
-                acc1[elem] = out_frag[1][dt][elem];
-              }
-              PvAccumVec pv_acc1;
-              if constexpr (F16PvAccum) {
-                pv_acc1 =
-                    __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(p_regs1, v_regs, acc1);
-              } else {
-                pv_acc1 =
-                    __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_regs1, v_regs, acc1);
-              }
-#pragma unroll
-              for (int elem = 0; elem < 8; ++elem) {
-                out_frag[1][dt][elem] = pv_acc1[elem];
-              }
-            }
-          }
-        }
-#pragma unroll
-        for (int qg = 0; qg < QGroups; ++qg) {
-          l[qg] += local_sum[qg] + __shfl_xor(local_sum[qg], 16, 32);
-        }
-        return;
-      }
       half8_vec prob_cache[QGroups][ColTiles];
       if constexpr (QuantizeQuery || UseRawPreparedQ) {
         float8_vec score_cache[QGroups][ColTiles];
@@ -2987,25 +2204,9 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
               k_scale_local =
                   k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
             }
-            if constexpr (UsePrepackedLaneMajorKey) {
-              compute_tqk_score_regs_raw_kq_2_lane_key<DTiles>(
-                  reinterpret_cast<const int8_t*>(k), k_head_base, k_stride_n * 64,
-                  kb_base, q_regs, lane, col_tile,
-                  qs[0] * k_scale_local, qs[1] * k_scale_local,
-                  !fully_future0, !fully_future1, scores0, scores1);
-            } else if constexpr (UseLaneMajorKey) {
+            if constexpr (UseLaneMajorKey) {
               compute_tqk_score_regs_raw_kq_2_lane_shared_key<DTiles>(
                   k_lane_tile, q_regs, lane, col_tile,
-                  qs[0] * k_scale_local, qs[1] * k_scale_local,
-                  !fully_future0, !fully_future1, scores0, scores1);
-            } else if constexpr (UseCkKeySharedLayout) {
-              compute_tqk_score_regs_raw_kq_2_ck_shared<PvOrderedQK, DTiles, BK, BC + 1>(
-                  &k_ck_tile[0][0][0], q_regs, lane, col_tile,
-                  qs[0] * k_scale_local, qs[1] * k_scale_local,
-                  !fully_future0, !fully_future1, scores0, scores1);
-            } else if constexpr (UseInt4QK) {
-              compute_tqk_score_regs_raw_i4_kq_2<PvOrderedQK, QKDTiles, SharedQKHeadStride>(
-                  reinterpret_cast<const uint8_t*>(&k_tile[0][0]), q_regs, lane, col_tile,
                   qs[0] * k_scale_local, qs[1] * k_scale_local,
                   !fully_future0, !fully_future1, scores0, scores1);
             } else {
@@ -3191,14 +2392,6 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
         }
       }
 
-      if constexpr (UseDelayedValueStaging) {
-        SAGEATTN_F16_SCHED_BARRIER(0x7f);
-        stage_value_tile();
-        if constexpr (UsesValueSharedMemory) {
-          __syncthreads();
-        }
-        SAGEATTN_F16_SCHED_BARRIER(0);
-      }
       SAGEATTN_F16_SCHED_BARRIER(0);
 #pragma unroll
       for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
@@ -3210,20 +2403,9 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
 #pragma unroll
         for (int dt = 0; dt < DTiles; ++dt) {
           half8_vec v_regs;
-          if constexpr (UsePrepackedLaneMajorValue) {
-            v_regs = make_v_regs_from_lane_major_global<DTiles>(
-                v, v_head_base, v_stride_n, kb_base, col_tile, dt, lane);
-          } else if constexpr (UseLaneMajorValue) {
+          if constexpr (UseLaneMajorValue) {
             v_regs = make_v_regs_from_lane_major_shared<DTiles>(
                 v_lane_tile, col_tile, dt, lane);
-          } else if constexpr (DirectGlobalValue) {
-            if constexpr (ValueTransposed) {
-              v_regs = make_v_regs_from_transposed_global(
-                  v, v_head_base, v_stride_n, kb_base, col_tile, dt, lane);
-            } else {
-              v_regs = make_v_regs_from_hnd_global(
-                  v, v_head_base, v_stride_n, kb_base, col_tile, dt, lane);
-            }
           } else if constexpr (UseTransposedValueLayout) {
             v_regs = make_v_regs_from_transposed_shared<SharedValueStride>(
                 &v_tile[0][0], col_tile, dt, lane);
@@ -3277,7 +2459,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
           }
         }
       }
-    } else if constexpr (!DirectGlobalValue) {
+    } else {
       const bool needs_causal_mask = ApplyCausalMask && (kb_base + BC > q_base);
 #pragma unroll
       for (int qg = 0; qg < QGroups; ++qg) {
@@ -3369,20 +2551,9 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
 #pragma unroll
           for (int dt = 0; dt < DTiles; ++dt) {
             half8_vec v_regs;
-            if constexpr (UsePrepackedLaneMajorValue) {
-              v_regs = make_v_regs_from_lane_major_global<DTiles>(
-                  v, v_head_base, v_stride_n, kb_base, col_tile, dt, lane);
-            } else if constexpr (UseLaneMajorValue) {
+            if constexpr (UseLaneMajorValue) {
               v_regs = make_v_regs_from_lane_major_shared<DTiles>(
                   v_lane_tile, col_tile, dt, lane);
-            } else if constexpr (DirectGlobalValue) {
-              if constexpr (ValueTransposed) {
-                v_regs = make_v_regs_from_transposed_global(
-                    v, v_head_base, v_stride_n, kb_base, col_tile, dt, lane);
-              } else {
-                v_regs = make_v_regs_from_hnd_global(
-                    v, v_head_base, v_stride_n, kb_base, col_tile, dt, lane);
-              }
             } else if constexpr (UseTransposedValueLayout) {
               v_regs = make_v_regs_from_transposed_shared<SharedValueStride>(
                   &v_tile[0][0], col_tile, dt, lane);
@@ -3421,28 +2592,13 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
 
   if constexpr (IsCausal) {
     const int64_t prefix_limit = q_base < kv_limit ? q_base : kv_limit;
-    if constexpr (ReverseCausalKv) {
-      static_assert((BlockRows % BlockCols) == 0,
-                    "reverse causal traversal requires q-blocks aligned to K tiles");
 #pragma unroll 2
-      for (int64_t kb_base = kv_limit; kb_base > prefix_limit;) {
-        kb_base -= BC;
-        process_kv_tile(kb_base, std::true_type{});
-      }
+    for (int64_t kb_base = 0; kb_base < prefix_limit; kb_base += BC) {
+      process_kv_tile(kb_base, std::false_type{});
+    }
 #pragma unroll 2
-      for (int64_t kb_base = prefix_limit; kb_base > 0;) {
-        kb_base -= BC;
-        process_kv_tile(kb_base, std::false_type{});
-      }
-    } else {
-#pragma unroll 2
-      for (int64_t kb_base = 0; kb_base < prefix_limit; kb_base += BC) {
-        process_kv_tile(kb_base, std::false_type{});
-      }
-#pragma unroll 2
-      for (int64_t kb_base = prefix_limit; kb_base < kv_limit; kb_base += BC) {
-        process_kv_tile(kb_base, std::true_type{});
-      }
+    for (int64_t kb_base = prefix_limit; kb_base < kv_limit; kb_base += BC) {
+      process_kv_tile(kb_base, std::true_type{});
     }
   } else {
 #pragma unroll 2
@@ -3485,10 +2641,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
       }
     }
   }
-    if constexpr (!PersistentCausalSchedule) {
-      return;
-    }
-    __syncthreads();
+    return;
   }
 }
 
@@ -5142,261 +4295,6 @@ __global__ void prepare_qkv_hnd_kernel(
 
 template <typename T,
           int GroupsPerBlock,
-          int Threads = 256>
-__global__ void prepare_qkv_hnd_f16_d64_groups_kernel(
-    const T* __restrict__ query,
-    const T* __restrict__ key,
-    const T* __restrict__ value,
-    int8_t* __restrict__ query_out,
-    int8_t* __restrict__ key_out,
-    float* __restrict__ query_scale,
-    float* __restrict__ key_scale,
-    __half* __restrict__ value_out,
-    const int64_t batch,
-    const int64_t q_heads,
-    const int64_t kv_heads,
-    const int64_t q_len,
-    const int64_t kv_len,
-    const int q_groups,
-    const int k_groups) {
-  constexpr int HeadDim = 64;
-  constexpr int PackElems = 8;
-  constexpr int KRows = 64;
-  constexpr int QRows = 32;
-  constexpr int ValueStride = HeadDim + 16;
-  static_assert(GroupsPerBlock == 2 || GroupsPerBlock == 4,
-                "grouped D64 QKV preparation supports 2 or 4 groups per CTA");
-
-  __shared__ float shared_q_amax[2];
-  __shared__ float shared_q_pair_amax[2][32];
-  __shared__ float shared_k_amax;
-  __shared__ __half value_tile[KRows][ValueStride];
-
-  const int block_group = blockIdx.x;
-  const int head = blockIdx.y;
-  const int b = blockIdx.z;
-  const int tid = threadIdx.x;
-  if (b >= batch || head >= q_heads || head >= kv_heads) {
-    return;
-  }
-
-#pragma unroll
-  for (int group_iter = 0; group_iter < GroupsPerBlock; ++group_iter) {
-    const int local_group = block_group * GroupsPerBlock + group_iter;
-    if (local_group >= k_groups) {
-      continue;
-    }
-
-    const int local_q_group = local_group * 2;
-    const int64_t q_base_row = static_cast<int64_t>(local_q_group) * QRows;
-    const bool has_q_group0 = local_q_group < q_groups && q_base_row < q_len;
-    const bool has_q_group1 =
-        (local_q_group + 1) < q_groups && (q_base_row + QRows) < q_len;
-    constexpr int q_packs = (QRows * HeadDim) / PackElems;
-    float local_q_amax0 = 0.0000001f;
-    float local_q_amax1 = 0.0000001f;
-    for (int pack = tid; pack < q_packs; pack += Threads) {
-      const int elem_base = pack * PackElems;
-      const int row = elem_base / HeadDim;
-      const int d = elem_base - row * HeadDim;
-      const int64_t seq0 = q_base_row + row;
-      if (has_q_group0 && seq0 < q_len) {
-        const int64_t off =
-            ((static_cast<int64_t>(b) * q_heads + head) * q_len + seq0) * HeadDim + d;
-        const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
-        const T* values = reinterpret_cast<const T*>(&raw);
-#pragma unroll
-        for (int i = 0; i < PackElems; ++i) {
-          local_q_amax0 = fmaxf(local_q_amax0, fabsf(value_to_float(values[i])));
-        }
-      }
-      const int64_t seq1 = q_base_row + QRows + row;
-      if (has_q_group1 && seq1 < q_len) {
-        const int64_t off =
-            ((static_cast<int64_t>(b) * q_heads + head) * q_len + seq1) * HeadDim + d;
-        const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
-        const T* values = reinterpret_cast<const T*>(&raw);
-#pragma unroll
-        for (int i = 0; i < PackElems; ++i) {
-          local_q_amax1 = fmaxf(local_q_amax1, fabsf(value_to_float(values[i])));
-        }
-      }
-    }
-    const int lane = tid & 31;
-    const int wid = tid >> 5;
-    local_q_amax0 = vllm::warpReduceMax(local_q_amax0);
-    local_q_amax1 = vllm::warpReduceMax(local_q_amax1);
-    if (lane == 0) {
-      shared_q_pair_amax[0][wid] = local_q_amax0;
-      shared_q_pair_amax[1][wid] = local_q_amax1;
-    }
-    __syncthreads();
-    const bool warp_lane_active = tid < (blockDim.x / 32);
-    local_q_amax0 = warp_lane_active ? shared_q_pair_amax[0][lane] : -1e20f;
-    local_q_amax1 = warp_lane_active ? shared_q_pair_amax[1][lane] : -1e20f;
-    local_q_amax0 = vllm::warpReduceMax(local_q_amax0);
-    local_q_amax1 = vllm::warpReduceMax(local_q_amax1);
-    if (tid == 0) {
-      shared_q_amax[0] = local_q_amax0;
-      shared_q_amax[1] = local_q_amax1;
-      if (has_q_group0) {
-        query_scale[(static_cast<int64_t>(b) * q_heads + head) * q_groups + local_q_group] =
-            local_q_amax0 / 127.0f;
-      }
-      if (has_q_group1) {
-        query_scale[(static_cast<int64_t>(b) * q_heads + head) * q_groups +
-                    local_q_group + 1] = local_q_amax1 / 127.0f;
-      }
-    }
-    __syncthreads();
-    const float inv_q_scale0 = 127.0f / shared_q_amax[0];
-    const float inv_q_scale1 = 127.0f / shared_q_amax[1];
-
-    for (int pack = tid; pack < q_packs; pack += Threads) {
-      const int elem_base = pack * PackElems;
-      const int row = elem_base / HeadDim;
-      const int d = elem_base - row * HeadDim;
-      const int64_t seq0 = q_base_row + row;
-      if (has_q_group0 && seq0 < q_len) {
-        const int64_t off =
-            ((static_cast<int64_t>(b) * q_heads + head) * q_len + seq0) * HeadDim + d;
-        const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
-        const T* values = reinterpret_cast<const T*>(&raw);
-        char4 out0;
-        char4 out1;
-        out0.x = float_to_int8_rn_gfx12(value_to_float(values[0]) * inv_q_scale0);
-        out0.y = float_to_int8_rn_gfx12(value_to_float(values[1]) * inv_q_scale0);
-        out0.z = float_to_int8_rn_gfx12(value_to_float(values[2]) * inv_q_scale0);
-        out0.w = float_to_int8_rn_gfx12(value_to_float(values[3]) * inv_q_scale0);
-        out1.x = float_to_int8_rn_gfx12(value_to_float(values[4]) * inv_q_scale0);
-        out1.y = float_to_int8_rn_gfx12(value_to_float(values[5]) * inv_q_scale0);
-        out1.z = float_to_int8_rn_gfx12(value_to_float(values[6]) * inv_q_scale0);
-        out1.w = float_to_int8_rn_gfx12(value_to_float(values[7]) * inv_q_scale0);
-        *reinterpret_cast<char4*>(query_out + off) = out0;
-        *reinterpret_cast<char4*>(query_out + off + 4) = out1;
-      }
-      const int64_t seq1 = q_base_row + QRows + row;
-      if (has_q_group1 && seq1 < q_len) {
-        const int64_t off =
-            ((static_cast<int64_t>(b) * q_heads + head) * q_len + seq1) * HeadDim + d;
-        const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
-        const T* values = reinterpret_cast<const T*>(&raw);
-        char4 out0;
-        char4 out1;
-        out0.x = float_to_int8_rn_gfx12(value_to_float(values[0]) * inv_q_scale1);
-        out0.y = float_to_int8_rn_gfx12(value_to_float(values[1]) * inv_q_scale1);
-        out0.z = float_to_int8_rn_gfx12(value_to_float(values[2]) * inv_q_scale1);
-        out0.w = float_to_int8_rn_gfx12(value_to_float(values[3]) * inv_q_scale1);
-        out1.x = float_to_int8_rn_gfx12(value_to_float(values[4]) * inv_q_scale1);
-        out1.y = float_to_int8_rn_gfx12(value_to_float(values[5]) * inv_q_scale1);
-        out1.z = float_to_int8_rn_gfx12(value_to_float(values[6]) * inv_q_scale1);
-        out1.w = float_to_int8_rn_gfx12(value_to_float(values[7]) * inv_q_scale1);
-        *reinterpret_cast<char4*>(query_out + off) = out0;
-        *reinterpret_cast<char4*>(query_out + off + 4) = out1;
-      }
-    }
-
-    const int64_t base_row = static_cast<int64_t>(local_group) * KRows;
-    if (base_row >= kv_len) {
-      __syncthreads();
-      continue;
-    }
-
-    constexpr int kv_packs = (KRows * HeadDim) / PackElems;
-    float local_k_amax = 0.0000001f;
-    for (int pack = tid; pack < kv_packs; pack += Threads) {
-      const int elem_base = pack * PackElems;
-      const int row = elem_base / HeadDim;
-      const int d = elem_base - row * HeadDim;
-      const int64_t seq = base_row + row;
-      if (seq < kv_len) {
-        const int64_t off =
-            ((static_cast<int64_t>(b) * kv_heads + head) * kv_len + seq) * HeadDim + d;
-        const uint4 raw = *reinterpret_cast<const uint4*>(key + off);
-        const T* values = reinterpret_cast<const T*>(&raw);
-#pragma unroll
-        for (int i = 0; i < PackElems; ++i) {
-          local_k_amax = fmaxf(local_k_amax, fabsf(value_to_float(values[i])));
-        }
-      }
-    }
-    const float block_k_amax = vllm::blockReduceMax(local_k_amax);
-    if (tid == 0) {
-      shared_k_amax = block_k_amax;
-      key_scale[(static_cast<int64_t>(b) * kv_heads + head) * k_groups + local_group] =
-          block_k_amax / 127.0f;
-    }
-    __syncthreads();
-    const float inv_k_scale = 127.0f / shared_k_amax;
-
-    for (int pack = tid; pack < kv_packs; pack += Threads) {
-      const int elem_base = pack * PackElems;
-      const int row = elem_base / HeadDim;
-      const int d = elem_base - row * HeadDim;
-      const int64_t seq = base_row + row;
-      if (seq < kv_len) {
-        const int64_t off =
-            ((static_cast<int64_t>(b) * kv_heads + head) * kv_len + seq) * HeadDim + d;
-        const uint4 raw_k = *reinterpret_cast<const uint4*>(key + off);
-        const uint4 raw_v = *reinterpret_cast<const uint4*>(value + off);
-        const T* k_values = reinterpret_cast<const T*>(&raw_k);
-        const T* v_values = reinterpret_cast<const T*>(&raw_v);
-        char4 out0;
-        char4 out1;
-        out0.x = float_to_int8_rn_gfx12(value_to_float(k_values[0]) * inv_k_scale);
-        out0.y = float_to_int8_rn_gfx12(value_to_float(k_values[1]) * inv_k_scale);
-        out0.z = float_to_int8_rn_gfx12(value_to_float(k_values[2]) * inv_k_scale);
-        out0.w = float_to_int8_rn_gfx12(value_to_float(k_values[3]) * inv_k_scale);
-        out1.x = float_to_int8_rn_gfx12(value_to_float(k_values[4]) * inv_k_scale);
-        out1.y = float_to_int8_rn_gfx12(value_to_float(k_values[5]) * inv_k_scale);
-        out1.z = float_to_int8_rn_gfx12(value_to_float(k_values[6]) * inv_k_scale);
-        out1.w = float_to_int8_rn_gfx12(value_to_float(k_values[7]) * inv_k_scale);
-        *reinterpret_cast<char4*>(key_out + off) = out0;
-        *reinterpret_cast<char4*>(key_out + off + 4) = out1;
-#pragma unroll
-        for (int i = 0; i < PackElems; ++i) {
-          if constexpr (std::is_same<T, __half>::value) {
-            value_tile[row][d + i] = v_values[i];
-          } else {
-            value_tile[row][d + i] = __float2half_rn(value_to_float(v_values[i]));
-          }
-        }
-      }
-    }
-    __syncthreads();
-
-    constexpr int StoreRows = 8;
-    constexpr int RowGroups = KRows / StoreRows;
-    for (int linear = tid; linear < HeadDim * RowGroups; linear += Threads) {
-      const int d = linear / RowGroups;
-      const int row = (linear - d * RowGroups) * StoreRows;
-      const int64_t seq = base_row + row;
-      const int64_t out_off =
-          ((static_cast<int64_t>(b) * kv_heads + head) * HeadDim + d) * kv_len + seq;
-      if (seq + StoreRows - 1 < kv_len) {
-        uint4 packed;
-        __half* vals = reinterpret_cast<__half*>(&packed);
-#pragma unroll
-        for (int i = 0; i < StoreRows; ++i) {
-          vals[i] = value_tile[row + i][d];
-        }
-        *reinterpret_cast<uint4*>(value_out + out_off) = packed;
-      } else {
-#pragma unroll
-        for (int i = 0; i < StoreRows; ++i) {
-          const int64_t tail_seq = seq + i;
-          if (tail_seq < kv_len) {
-            value_out[out_off + i] = value_tile[row + i][d];
-          }
-        }
-      }
-    }
-    __syncthreads();
-  }
-}
-
-template <typename T,
-          int GroupsPerBlock,
           bool TransposedValueStaging = false,
           bool LaneMajorKV = false,
           int HeadDim = 64,
@@ -6674,8 +5572,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     torch::Tensor key_scale,
     int tensor_layout,
     int is_causal,
-    float sm_scale,
-    bool use_f16_klane_prepack_hint);
+    float sm_scale);
 
 torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     torch::Tensor query,
@@ -6750,7 +5647,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     constexpr bool use_f16_tvload = false;
 #define SAGEATTN_LAUNCH_RAW_QK_F16_CAUSAL(BR_, TVLOAD_, PAD_, F16ACC_) \
     if (head_dim == 16) { \
-      hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, false, PAD_, true, TVLOAD_, F16ACC_, __half, true, __half, true, false, false, false, false, false, false, false, false, 16>), grid, block, 0, stream, \
+      hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, false, PAD_, true, TVLOAD_, F16ACC_, __half, true, __half, true, false, false, false, false, 16>), grid, block, 0, stream, \
           reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), \
           reinterpret_cast<const __half*>(key.data_ptr<at::Half>()), \
           reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
@@ -6930,35 +5827,20 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
 
 #define SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC(BC_, VT_, OUT_T_) \
     if (head_dim == 16) { \
-      if (block_rows == 32) { \
-        if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 32, VT_, true, OUT_T_); } \
-        else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 32, VT_, false, OUT_T_); } \
-      } else if (block_rows == 64) { \
+      if (block_rows == 64) { \
         if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 64, VT_, true, OUT_T_); } \
         else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 64, VT_, false, OUT_T_); } \
       } else if (block_rows == 256) { \
         if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 256, VT_, true, OUT_T_); } \
         else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 256, VT_, false, OUT_T_); } \
-      } else if (block_rows == 512) { \
-        if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 512, VT_, true, OUT_T_); } \
-        else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 512, VT_, false, OUT_T_); } \
       } else { \
         if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 128, VT_, true, OUT_T_); } \
         else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 16, 128, VT_, false, OUT_T_); } \
       } \
     } else if (head_dim == 128) { \
-      if (block_rows == 32) { \
-        if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 32, true, true, OUT_T_); } \
-        else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 32, true, false, OUT_T_); } \
-      } else if (block_rows == 64) { \
+      if (block_rows == 64) { \
         if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 64, true, true, OUT_T_); } \
         else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 64, true, false, OUT_T_); } \
-      } else if (block_rows == 256) { \
-        if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 256, true, true, OUT_T_); } \
-        else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 256, true, false, OUT_T_); } \
-      } else if (block_rows == 512) { \
-        if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 512, true, true, OUT_T_); } \
-        else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 512, true, false, OUT_T_); } \
       } else { \
         if (is_causal) { \
           if constexpr ((BC_) == 64) { \
@@ -6973,15 +5855,9 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         } \
         else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 128, 128, true, false, OUT_T_); } \
       } \
-    } else if (block_rows == 512) { \
-      if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 512, VT_, true, OUT_T_); } \
-      else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 512, VT_, false, OUT_T_); } \
     } else if (block_rows == 256) { \
       if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 256, VT_, true, OUT_T_); } \
       else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 256, VT_, false, OUT_T_); } \
-    } else if (block_rows == 32) { \
-      if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 32, VT_, true, OUT_T_); } \
-      else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 32, VT_, false, OUT_T_); } \
     } else if (block_rows == 64) { \
       if (is_causal) { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 64, VT_, true, OUT_T_); } \
       else { SAGEATTN_LAUNCH_PREPARED_FP8(BC_, 64, 64, VT_, false, OUT_T_); } \
@@ -6991,42 +5867,22 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     }
 
 #define SAGEATTN_DISPATCH_PREPARED_FP8_TV(OUT_T_) \
-    if (block_cols == 16 && head_dim == 128) { \
-      if (transpose_fp8_value) { SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC(16, true, OUT_T_); } \
-      else { SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC(16, false, OUT_T_); } \
-    } else if (block_cols == 32) { \
-      if (transpose_fp8_value) { SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC(32, true, OUT_T_); } \
-      else { SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC(32, false, OUT_T_); } \
-    } else if (block_cols == 128 && head_dim == 64) { \
-      if (transpose_fp8_value) { SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC(128, true, OUT_T_); } \
-      else { SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC(128, false, OUT_T_); } \
-    } else { \
-      if (transpose_fp8_value) { SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC(64, true, OUT_T_); } \
-      else { SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC(64, false, OUT_T_); } \
-    }
+    SAGEATTN_DISPATCH_PREPARED_FP8_VT_BC(64, true, OUT_T_)
 
     if (use_fused_q) {
 #define SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_CAUSAL(BC_, HD_, CAUSAL_) \
-      if (block_rows == 32) { SAGEATTN_LAUNCH_FUSED_Q_FP8(BC_, HD_, 32, CAUSAL_); } \
-      else if (block_rows == 64) { SAGEATTN_LAUNCH_FUSED_Q_FP8(BC_, HD_, 64, CAUSAL_); } \
+      if (block_rows == 64) { SAGEATTN_LAUNCH_FUSED_Q_FP8(BC_, HD_, 64, CAUSAL_); } \
       else if (block_rows == 256) { SAGEATTN_LAUNCH_FUSED_Q_FP8(BC_, HD_, 256, CAUSAL_); } \
-      else if (block_rows == 512) { SAGEATTN_LAUNCH_FUSED_Q_FP8(BC_, HD_, 512, CAUSAL_); } \
       else { SAGEATTN_LAUNCH_FUSED_Q_FP8(BC_, HD_, 128, CAUSAL_); }
 #define SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(BC_, HD_) \
       if (is_causal) { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_CAUSAL(BC_, HD_, true); } \
       else { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_CAUSAL(BC_, HD_, false); }
       if (head_dim == 16) {
-        if (block_cols == 32) { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(32, 16); }
-        else { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(64, 16); }
+        SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(64, 16);
       } else if (head_dim == 128) {
-        if (block_cols == 128) { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(128, 128); }
-        else if (block_cols == 16) { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(16, 128); }
-        else if (block_cols == 32) { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(32, 128); }
-        else { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(64, 128); }
+        SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(64, 128);
       } else {
-        if (block_cols == 128) { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(128, 64); }
-        else if (block_cols == 32) { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(32, 64); }
-        else { SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(64, 64); }
+        SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD(64, 64);
       }
 #undef SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD
 #undef SAGEATTN_DISPATCH_FUSED_Q_FP8_BC_HD_CAUSAL
@@ -7050,8 +5906,6 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         head_dim == 64 && auto_f16_1q_short;
     const bool use_f16_fused_q_1q =
         head_dim == 64 && auto_f16_1q_short;
-    constexpr bool use_f16_noncausal_1q_rawv = false;
-    constexpr bool request_f16_ck_key_layout = false;
     const bool use_f16_raw_value =
         head_dim == 64 &&
         (use_raw_f16_value ||
@@ -7064,7 +5918,6 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
       }
     }
     if (head_dim == 64 && is_causal && !use_f16_fused_q_1q &&
-        !request_f16_ck_key_layout &&
         q_len >= 2048 && (q_len % 256) == 0) {
       block_rows = 256;
     }
@@ -7072,53 +5925,35 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     if (use_f16_fused_q_1q && block_rows != 128) {
       block_rows = 64;
     }
-    const dim3 block((use_f16_fused_q_1q || use_f16_noncausal_1q_rawv) ?
-                         (block_rows / 16) * 32 :
-                         block_rows);
+    const dim3 block(use_f16_fused_q_1q ? (block_rows / 16) * 32 : block_rows);
     const bool use_f16_flat_q_schedule =
         head_dim == 64 && is_causal && !use_f16_fused_q_1q &&
         q_len >= 2048;
     const int64_t q_blocks = (q_len + block_rows - 1) / block_rows;
     const dim3 grid(q_blocks, q_heads, batch);
     const dim3 grid_f16_flat(q_blocks * q_heads * batch);
-    constexpr bool use_f16_persistent_q_schedule = false;
-    const dim3 grid_f16_persistent(1);
     const hipStream_t stream = at::cuda::getCurrentCUDAStream();
     constexpr bool use_f16_pv_accum = true;
     const bool use_f16_pv_ordered_qk =
         use_f16_pv_accum && !use_f16_raw_value &&
         q_len >= 1024;
-    constexpr bool use_f16_noncausal_vlane = false;
-    constexpr bool use_f16_noncausal_klane = false;
     const bool auto_f16_lane_qk =
         head_dim == 64 && is_causal && (q_len == 2048 || q_len == 4096);
-    constexpr bool use_f16_vglobal = false;
     const bool use_f16_vlane =
-        !use_f16_vglobal &&
         (((q_len >= 1024 && q_len <= 2048) || q_len >= 8192) ||
          auto_f16_lane_qk);
     const bool use_f16_streamk =
-        !use_f16_vglobal &&
-        !request_f16_ck_key_layout &&
         head_dim == 64 && is_causal && q_len == 2048 && block_rows == 256;
-    constexpr bool use_f16_vlane_prepack = false;
-    constexpr bool use_f16_klane_prepack = false;
     const bool use_f16_klane =
-        !use_f16_klane_prepack && !use_f16_raw_value && block_cols == 64 &&
+        !use_f16_raw_value && block_cols == 64 &&
         use_f16_pv_ordered_qk &&
         auto_f16_lane_qk;
-    constexpr bool use_f16_delay_v = false;
-    constexpr bool use_f16_1q_split_prefix = false;
-    constexpr bool use_f16_reverse_kv = false;
-    constexpr bool use_f16_cache_q = false;
-    constexpr bool use_f16_no_prob_cache = false;
-    constexpr bool use_f16_ck_key_layout = false;
     std::vector<torch::Tensor> prepared = use_f16_raw_value ?
         prepare_k_hnd_packed_gfx12(key) :
         prepare_kv_hnd_packed_gfx12<__half, false>(query, key, value);
-#define SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(BC_, BR_, PAD_, F16ACC_, PVORDER_, VGLOBAL_, VLANE_, STREAM_, KLANE_, KPREPACK_) \
+#define SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_) \
     if (head_dim == 16) { \
-      hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VGLOBAL_, VLANE_, STREAM_, false, KLANE_, KPREPACK_, false, 16>), grid, block, 0, stream, \
+      hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, 16>), grid, block, 0, stream, \
           reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
           reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
           reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -7132,22 +5967,8 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
           prepared[1].stride(0), prepared[1].stride(1), \
           kHND, sm_scale); \
     } else { \
-      if (use_f16_persistent_q_schedule) { \
-        hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VGLOBAL_, VLANE_, STREAM_, false, KLANE_, KPREPACK_, false, 64, false, false, false, false, false, false, true>), grid_f16_persistent, block, 0, stream, \
-          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
-          reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
-          reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
-          nullptr, prepared[1].data_ptr<float>(), \
-          batch, q_len, kv_len, q_heads, kv_heads, \
-          query.stride(0), query.stride(2), query.stride(1), \
-          prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
-          prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
-          output.stride(0), output.stride(2), output.stride(1), \
-          0, 0, \
-          prepared[1].stride(0), prepared[1].stride(1), \
-          kHND, sm_scale); \
-      } else if (use_f16_flat_q_schedule) { \
-        hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VGLOBAL_, VLANE_, STREAM_, false, KLANE_, KPREPACK_, false, 64, false, false, false, false, false, true>), grid_f16_flat, block, 0, stream, \
+      if (use_f16_flat_q_schedule) { \
+        hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, 64, true>), grid_f16_flat, block, 0, stream, \
           reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
           reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
           reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -7161,7 +5982,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
           prepared[1].stride(0), prepared[1].stride(1), \
           kHND, sm_scale); \
       } else { \
-        hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VGLOBAL_, VLANE_, STREAM_, false, KLANE_, KPREPACK_>), grid, block, 0, stream, \
+        hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_>), grid, block, 0, stream, \
           reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
           reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
           reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -7178,7 +5999,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     }
 #define SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(BR_, PAD_, F16ACC_, PVORDER_, VLANE_, KLANE_) \
     if (head_dim == 16) { \
-      hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, false, false, F16ACC_, __half, true, int8_t, false, PVORDER_, false, false, false, false, false, false, false, 16>), grid, block, 0, stream, \
+      hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, false, false, F16ACC_, __half, true, int8_t, false, PVORDER_, false, false, false, 16>), grid, block, 0, stream, \
           reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
           reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
           reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -7192,7 +6013,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         prepared[1].stride(0), prepared[1].stride(1), \
         kHND, sm_scale); \
     } else { \
-      hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, false, false, F16ACC_, __half, true, int8_t, false, PVORDER_, false, VLANE_, false, false, KLANE_, false>), grid, block, 0, stream, \
+      hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, false, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, false, KLANE_>), grid, block, 0, stream, \
         reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
         reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -7206,100 +6027,8 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         prepared[1].stride(0), prepared[1].stride(1), \
         kHND, sm_scale); \
     }
-#define SAGEATTN_LAUNCH_F16_FUSED_Q_TV_PREPACK_CAUSAL(BR_, PAD_, F16ACC_, PVORDER_, STREAM_, KLANE_, KPREPACK_) \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, false, false, STREAM_, true, KLANE_, KPREPACK_>), grid, block, 0, stream, \
-        reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
-        reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
-        reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
-        nullptr, prepared[1].data_ptr<float>(), \
-        batch, q_len, kv_len, q_heads, kv_heads, \
-        query.stride(0), query.stride(2), query.stride(1), \
-        prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
-        prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
-        output.stride(0), output.stride(2), output.stride(1), \
-        0, 0, \
-        prepared[1].stride(0), prepared[1].stride(1), \
-        kHND, sm_scale)
-#define SAGEATTN_LAUNCH_F16_FUSED_Q_TV_DELAY_CAUSAL(BR_, PAD_, KLANE_, KPREPACK_) \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, true, false, true, __half, true, int8_t, false, true, false, true, false, false, KLANE_, KPREPACK_, false, 64, true>), grid, block, 0, stream, \
-        reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
-        reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
-        reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
-        nullptr, prepared[1].data_ptr<float>(), \
-        batch, q_len, kv_len, q_heads, kv_heads, \
-        query.stride(0), query.stride(2), query.stride(1), \
-        prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
-        prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
-        output.stride(0), output.stride(2), output.stride(1), \
-        0, 0, \
-        prepared[1].stride(0), prepared[1].stride(1), \
-        kHND, sm_scale)
-#define SAGEATTN_LAUNCH_F16_FUSED_Q_TV_REVERSE_CAUSAL(BR_, PAD_) \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, true, false, true, __half, true, int8_t, false, true, false, true, false, false, true, false, false, 64, false, true>), grid, block, 0, stream, \
-        reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
-        reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
-        reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
-        nullptr, prepared[1].data_ptr<float>(), \
-        batch, q_len, kv_len, q_heads, kv_heads, \
-        query.stride(0), query.stride(2), query.stride(1), \
-        prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
-        prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
-        output.stride(0), output.stride(2), output.stride(1), \
-        0, 0, \
-        prepared[1].stride(0), prepared[1].stride(1), \
-        kHND, sm_scale)
-#define SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CACHE_Q_CAUSAL(BR_, PAD_) \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, true, false, true, __half, true, int8_t, false, true, false, true, false, false, true, false, false, 64, false, false, true>), grid, block, 0, stream, \
-        reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
-        reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
-        reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
-        nullptr, prepared[1].data_ptr<float>(), \
-        batch, q_len, kv_len, q_heads, kv_heads, \
-        query.stride(0), query.stride(2), query.stride(1), \
-        prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
-        prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
-        output.stride(0), output.stride(2), output.stride(1), \
-        0, 0, \
-        prepared[1].stride(0), prepared[1].stride(1), \
-        kHND, sm_scale)
-#define SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NO_PROB_CACHE_CAUSAL(BR_, PAD_) \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, true, false, true, __half, true, int8_t, false, true, false, true, false, false, true, false, false, 64, false, false, false, true>), grid, block, 0, stream, \
-        reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
-        reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
-        reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
-        nullptr, prepared[1].data_ptr<float>(), \
-        batch, q_len, kv_len, q_heads, kv_heads, \
-        query.stride(0), query.stride(2), query.stride(1), \
-        prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
-        prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
-        output.stride(0), output.stride(2), output.stride(1), \
-        0, 0, \
-        prepared[1].stride(0), prepared[1].stride(1), \
-        kHND, sm_scale)
-#define SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CK_KEY_CAUSAL_GRID(BR_, PAD_, VLANE_, GRID_, FLAT_, PERSIST_) \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, true, false, true, __half, true, int8_t, false, true, false, VLANE_, false, false, false, false, false, 64, false, false, false, false, true, FLAT_, PERSIST_>), GRID_, block, 0, stream, \
-        reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
-        reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
-        reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
-        nullptr, prepared[1].data_ptr<float>(), \
-        batch, q_len, kv_len, q_heads, kv_heads, \
-        query.stride(0), query.stride(2), query.stride(1), \
-        prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
-        prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
-        output.stride(0), output.stride(2), output.stride(1), \
-        0, 0, \
-        prepared[1].stride(0), prepared[1].stride(1), \
-        kHND, sm_scale)
-#define SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CK_KEY_CAUSAL(BR_, PAD_, VLANE_) \
-    if (use_f16_persistent_q_schedule) { \
-      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CK_KEY_CAUSAL_GRID(BR_, PAD_, VLANE_, grid_f16_persistent, false, true); \
-    } else if (use_f16_flat_q_schedule) { \
-      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CK_KEY_CAUSAL_GRID(BR_, PAD_, VLANE_, grid_f16_flat, true, false); \
-    } else { \
-      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CK_KEY_CAUSAL_GRID(BR_, PAD_, VLANE_, grid, false, false); \
-    }
-#define SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(BC_, BR_, PAD_, F16ACC_, VGLOBAL_, VLANE_, STREAM_) \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, false, PAD_, true, true, F16ACC_, __half, true, int8_t, false, false, VGLOBAL_, VLANE_, STREAM_>), grid, block, 0, stream, \
+#define SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(BC_, BR_, PAD_, F16ACC_, VLANE_, STREAM_) \
+    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, false, PAD_, true, true, F16ACC_, __half, true, int8_t, false, false, VLANE_, STREAM_>), grid, block, 0, stream, \
         reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
         reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -7326,20 +6055,6 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         0, 0, \
         prepared[1].stride(0), prepared[1].stride(1), \
         kHND, sm_scale)
-#define SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_NONCAUSAL(BR_, F16ACC_) \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_kernel<64, BR_, true, false, 4, false, true, F16ACC_, true, __half, true>), grid, block, 0, stream, \
-        reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
-        reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
-        reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
-        nullptr, prepared[1].data_ptr<float>(), \
-        batch, q_len, kv_len, q_heads, kv_heads, \
-        query.stride(0), query.stride(2), query.stride(1), \
-        prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
-        value.stride(0), value.stride(2), value.stride(1), \
-        output.stride(0), output.stride(2), output.stride(1), \
-        0, 0, \
-        prepared[1].stride(0), prepared[1].stride(1), \
-        kHND, sm_scale)
 #define SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_TV_CAUSAL(BR_, F16ACC_) \
     hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_kernel<64, BR_, true, true, 4, true, false, F16ACC_, true, __half, true>), grid, block, 0, stream, \
         reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
@@ -7354,183 +6069,51 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         0, 0, \
         prepared[1].stride(0), prepared[1].stride(1), \
         kHND, sm_scale)
-#define SAGEATTN_DISPATCH_F16_FUSED_Q_TV_NONCAUSAL_ORDERED(BR_, PAD_) \
-    if (use_f16_noncausal_vlane && use_f16_noncausal_klane) { \
-      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(BR_, PAD_, true, true, true, true); \
-    } else if (use_f16_noncausal_vlane) { \
-      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(BR_, PAD_, true, true, true, false); \
-    } else if (use_f16_noncausal_klane) { \
-      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(BR_, PAD_, true, true, false, true); \
-    } else { \
-      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(BR_, PAD_, true, true, false, false); \
-    }
 #define SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(BR_, PAD_) \
-    if (block_cols == 128) { \
-      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(128, BR_, PAD_, false, false, false, false, false, false, false); \
-    } else if (use_f16_delay_v && use_f16_klane_prepack) { \
-      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_DELAY_CAUSAL(BR_, PAD_, false, true); \
-    } else if (use_f16_delay_v) { \
-      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_DELAY_CAUSAL(BR_, PAD_, true, false); \
-    } else if (use_f16_vlane_prepack) { \
-      if (use_f16_pv_accum) { \
-        if (use_f16_pv_ordered_qk) { \
-          if (use_f16_klane_prepack && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_PREPACK_CAUSAL(BR_, PAD_, true, true, true, false, true); } \
-          else if (use_f16_klane_prepack) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_PREPACK_CAUSAL(BR_, PAD_, true, true, false, false, true); } \
-          else if (use_f16_klane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_PREPACK_CAUSAL(BR_, PAD_, true, true, true, true, false); } \
-          else if (use_f16_klane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_PREPACK_CAUSAL(BR_, PAD_, true, true, false, true, false); } \
-          else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_PREPACK_CAUSAL(BR_, PAD_, true, true, true, false, false); } \
-          else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_PREPACK_CAUSAL(BR_, PAD_, true, true, false, false, false); } \
-        } else { \
-          if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_PREPACK_CAUSAL(BR_, PAD_, true, false, true, false, false); } \
-          else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_PREPACK_CAUSAL(BR_, PAD_, true, false, false, false, false); } \
-        } \
-      } else { \
-        if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_PREPACK_CAUSAL(BR_, PAD_, false, false, true, false, false); } \
-        else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_PREPACK_CAUSAL(BR_, PAD_, false, false, false, false, false); } \
-      } \
-    } else if (use_f16_pv_accum) { \
-      if (use_f16_raw_value) { \
-        if (block_cols == 32) { \
-          if (use_f16_vglobal) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(32, BR_, PAD_, true, true, false, false); } \
-          else { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(32, BR_, PAD_, true, false, false, false); } \
-        } else { \
-          if (use_f16_vglobal) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, true, false, false); } \
-          else if (use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, false, true, true); } \
-          else if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, false, true, false); } \
-          else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, false, false, true); } \
-          else { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, false, false, false); } \
-        } \
-      } else if (use_f16_pv_ordered_qk) { \
-        if (block_cols == 32) { \
-          if (use_f16_vglobal) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(32, BR_, PAD_, true, true, true, false, false, false, false); } \
-          else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(32, BR_, PAD_, true, true, false, false, false, false, false); } \
-        } else { \
-          if (use_f16_klane_prepack && use_f16_vglobal) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, false, false, false, true); } \
-          else if (use_f16_klane && use_f16_vglobal) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, false, false, true, false); } \
-          else if (use_f16_vglobal) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, false, false, false, false); } \
-          else if (use_f16_klane_prepack && use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, true, true, false, true); } \
-          else if (use_f16_klane_prepack && use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, true, false, false, true); } \
-          else if (use_f16_klane_prepack && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, false, true, false, true); } \
-          else if (use_f16_klane_prepack) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, false, false, false, true); } \
-          else if (use_f16_klane && use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, true, true, true, false); } \
-          else if (use_f16_klane && use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, true, false, true, false); } \
-          else if (use_f16_klane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, false, true, true, false); } \
-          else if (use_f16_klane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, false, false, true, false); } \
-          else if (use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, true, true, false, false); } \
-          else if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, true, false, false, false); } \
-          else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, false, true, false, false); } \
-          else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, false, false, false, false); } \
-        } \
-      } else { \
-        if (block_cols == 32) { \
-          if (use_f16_vglobal) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(32, BR_, PAD_, true, false, true, false, false, false, false); } \
-          else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(32, BR_, PAD_, true, false, false, false, false, false, false); } \
-        } else { \
-          if (use_f16_vglobal) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, true, false, false, false, false); } \
-          else if (use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, false, true, true, false, false); } \
-          else if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, false, true, false, false, false); } \
-          else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, false, false, true, false, false); } \
-          else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, false, false, false, false, false); } \
-        } \
-      } \
+    if (use_f16_raw_value) { \
+      if (use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, true, true); } \
+      else if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, true, false); } \
+      else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, false, true); } \
+      else { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, true, false, false); } \
+    } else if (use_f16_pv_ordered_qk) { \
+      if (use_f16_klane && use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, true, true); } \
+      else if (use_f16_klane && use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, false, true); } \
+      else if (use_f16_klane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, true, true); } \
+      else if (use_f16_klane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, false, true); } \
+      else if (use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, true, false); } \
+      else if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, true, false, false); } \
+      else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, true, false); } \
+      else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, true, false, false, false); } \
     } else { \
-      if (use_f16_raw_value) { \
-        if (block_cols == 32) { \
-          if (use_f16_vglobal) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(32, BR_, PAD_, false, true, false, false); } \
-          else { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(32, BR_, PAD_, false, false, false, false); } \
-        } else { \
-          if (use_f16_vglobal) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, false, true, false, false); } \
-          else if (use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, false, false, true, true); } \
-          else if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, false, false, true, false); } \
-          else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, false, false, false, true); } \
-          else { SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(64, BR_, PAD_, false, false, false, false); } \
-        } \
-      } else { \
-        if (block_cols == 32) { \
-          if (use_f16_vglobal) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(32, BR_, PAD_, false, false, true, false, false, false, false); } \
-          else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(32, BR_, PAD_, false, false, false, false, false, false, false); } \
-        } else { \
-          if (use_f16_vglobal) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, false, false, true, false, false, false, false); } \
-          else if (use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, false, false, false, true, true, false, false); } \
-          else if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, false, false, false, true, false, false, false); } \
-          else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, false, false, false, false, true, false, false); } \
-          else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, false, false, false, false, false, false, false); } \
-        } \
-      } \
+      if (use_f16_vlane && use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, true, true, false); } \
+      else if (use_f16_vlane) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, true, false, false); } \
+      else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, false, true, false); } \
+      else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(64, BR_, PAD_, true, false, false, false, false); } \
     }
-    if (!is_causal && use_f16_noncausal_1q_rawv) {
-      if (use_f16_pv_accum) {
-        SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_NONCAUSAL(128, true);
-      } else {
-        SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_NONCAUSAL(128, false);
-      }
-    } else if (!is_causal) {
+    if (!is_causal) {
       TORCH_CHECK(block_cols == 64,
                   "native fp16 fused-Q non-causal path currently supports BC64");
       TORCH_CHECK(!use_f16_raw_value,
                   "native fp16 fused-Q non-causal path requires transposed prepared values");
-      if (use_f16_pv_accum) {
-        if (use_f16_pv_ordered_qk) {
-          if (block_rows == 64) { SAGEATTN_DISPATCH_F16_FUSED_Q_TV_NONCAUSAL_ORDERED(64, 4); }
-          else if (block_rows == 256) { SAGEATTN_DISPATCH_F16_FUSED_Q_TV_NONCAUSAL_ORDERED(256, 4); }
-          else if (block_rows == 512) { SAGEATTN_DISPATCH_F16_FUSED_Q_TV_NONCAUSAL_ORDERED(512, 4); }
-          else { SAGEATTN_DISPATCH_F16_FUSED_Q_TV_NONCAUSAL_ORDERED(128, 4); }
-        } else {
-          if (block_rows == 64) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(64, 4, true, false, false, false); }
-          else if (block_rows == 256) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(256, 4, true, false, false, false); }
-          else if (block_rows == 512) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(512, 4, true, false, false, false); }
-          else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(128, 4, true, false, false, false); }
-        }
+      if (use_f16_pv_ordered_qk) {
+        if (block_rows == 64) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(64, 4, true, true, false, false); }
+        else if (block_rows == 256) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(256, 4, true, true, false, false); }
+        else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(128, 4, true, true, false, false); }
       } else {
-        if (block_rows == 64) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(64, 4, false, false, false, false); }
-        else if (block_rows == 256) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(256, 4, false, false, false, false); }
-        else if (block_rows == 512) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(512, 4, false, false, false, false); }
-        else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(128, 4, false, false, false, false); }
+        if (block_rows == 64) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(64, 4, true, false, false, false); }
+        else if (block_rows == 256) { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(256, 4, true, false, false, false); }
+        else { SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(128, 4, true, false, false, false); }
       }
     } else if (use_f16_fused_q_1q) {
-      if (use_f16_pv_accum) {
-        if (use_f16_fused_q_1q_tv && block_rows == 128) {
-          SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_TV_CAUSAL(128, true);
-        } else if (use_f16_fused_q_1q_tv) {
-          SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_TV_CAUSAL(64, true);
-        } else if (block_rows == 128) {
-          if (use_f16_1q_split_prefix) {
-            SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL(128, true, true);
-          } else {
-            SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL(128, true, false);
-          }
-        } else {
-          SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL(64, true, false);
-        }
+      if (use_f16_fused_q_1q_tv && block_rows == 128) {
+        SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_TV_CAUSAL(128, true);
+      } else if (use_f16_fused_q_1q_tv) {
+        SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_TV_CAUSAL(64, true);
+      } else if (block_rows == 128) {
+        SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL(128, true, false);
       } else {
-        if (use_f16_fused_q_1q_tv && block_rows == 128) {
-          SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_TV_CAUSAL(128, false);
-        } else if (use_f16_fused_q_1q_tv) {
-          SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_TV_CAUSAL(64, false);
-        } else if (block_rows == 128) {
-          if (use_f16_1q_split_prefix) {
-            SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL(128, false, true);
-          } else {
-            SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL(128, false, false);
-          }
-        } else {
-          SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL(64, false, false);
-        }
+        SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL(64, true, false);
       }
-    } else if (use_f16_no_prob_cache) {
-      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NO_PROB_CACHE_CAUSAL(128, 4);
-    } else if (use_f16_ck_key_layout) {
-      if (use_f16_vlane) {
-        SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CK_KEY_CAUSAL(128, 4, true);
-      } else {
-        SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CK_KEY_CAUSAL(128, 4, false);
-      }
-    } else if (use_f16_cache_q) {
-      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CACHE_Q_CAUSAL(128, 4);
-    } else if (use_f16_reverse_kv) {
-      SAGEATTN_LAUNCH_F16_FUSED_Q_TV_REVERSE_CAUSAL(128, 4);
-    } else if (block_rows == 32) {
-      SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(32, 4);
     } else if (block_rows == 64) {
       SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(64, 4);
     } else if (block_rows == 256) {
@@ -7547,25 +6130,17 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
       SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL(128, 16);
     }
 #undef SAGEATTN_DISPATCH_F16_FUSED_Q_TV_CAUSAL
-#undef SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CK_KEY_CAUSAL
-#undef SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NO_PROB_CACHE_CAUSAL
-#undef SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CACHE_Q_CAUSAL
-#undef SAGEATTN_LAUNCH_F16_FUSED_Q_TV_REVERSE_CAUSAL
-#undef SAGEATTN_LAUNCH_F16_FUSED_Q_TV_DELAY_CAUSAL
 #undef SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_TV_CAUSAL
-#undef SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_NONCAUSAL
 #undef SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL
 #undef SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL
-#undef SAGEATTN_LAUNCH_F16_FUSED_Q_TV_PREPACK_CAUSAL
 #undef SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL
-#undef SAGEATTN_DISPATCH_F16_FUSED_Q_TV_NONCAUSAL_ORDERED
 #undef SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL
     hip_kernel_launch_check();
   } else if (use_raw_f16_value) {
     std::vector<torch::Tensor> prepared = quant_qk_int8_hnd_gfx12(query, key);
     qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         prepared[0], prepared[2], value, output, prepared[1], prepared[3],
-        kHND, is_causal, sm_scale, false);
+        kHND, is_causal, sm_scale);
   } else {
     const bool use_f16_separate_prepared =
         is_causal && head_dim == 64 && q_len == 4096 &&
@@ -7576,7 +6151,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
              prepare_qkv_hnd_packed_gfx12<__half, false>(query, key, value);
     qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         prepared[0], prepared[2], prepared[4], output, prepared[1], prepared[3],
-        kHND, is_causal, sm_scale, false);
+        kHND, is_causal, sm_scale);
   }
   return output;
 }
@@ -7590,8 +6165,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     torch::Tensor key_scale,
     int tensor_layout,
     int is_causal,
-    float sm_scale,
-    bool use_f16_klane_prepack_hint) {
+    float sm_scale) {
   TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && output.is_cuda(),
               "native gfx12 tensors must be CUDA/HIP tensors");
   TORCH_CHECK(query.scalar_type() == torch::kInt8, "query must be int8");
@@ -7715,8 +6289,6 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   dim3 block((use_2q || use_fp8_2q) ? block_rows : (block_rows == 128 ? 256 : 128));
   dim3 grid(q_blocks, q_heads, batch);
   dim3 grid_f16_flat(q_blocks * q_heads * batch);
-  constexpr bool use_f16_persistent_q_schedule = false;
-  dim3 grid_f16_persistent(1);
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   const bool use_f16_tvload =
       !value_is_fp8 && is_causal && hnd_contiguous && !value_transposed_hnd &&
@@ -7724,24 +6296,14 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   const bool use_f16_pv_accum =
       !value_is_fp8 && is_causal && value_transposed_hnd && block_cols == 64 &&
       q_len >= 1024;
-  constexpr bool use_f16_klane_prepack_env = false;
-  constexpr bool use_f16_klane_env = false;
   const bool use_f16_pv_ordered_qk =
       use_f16_pv_accum && q_len >= 4096;
-  const bool use_f16_klane_prepack =
-      head_dim == 64 &&
-      (use_f16_klane_prepack_env || use_f16_klane_prepack_hint) &&
-      use_f16_pv_ordered_qk;
-  const bool use_f16_klane =
-      head_dim == 64 && !use_f16_klane_prepack && use_f16_klane_env && use_f16_pv_ordered_qk;
-  constexpr bool use_f16_vglobal = false;
   const bool use_f16_vlane =
-      head_dim == 64 && !use_f16_vglobal && !value_is_fp8 && is_causal && value_transposed_hnd &&
+      head_dim == 64 && !value_is_fp8 && is_causal && value_transposed_hnd &&
       q_len == 4096 && block_rows == 256;
   const bool use_f16_streamk =
-      head_dim == 64 && !use_f16_vglobal && !value_is_fp8 && is_causal && value_transposed_hnd &&
+      head_dim == 64 && !value_is_fp8 && is_causal && value_transposed_hnd &&
       q_len == 4096 && block_rows == 256;
-  constexpr bool use_f16_ck_key_layout = false;
 #define SAGEATTN_LAUNCH_FP8_2Q_OUT(BC_, HD_, HND_, BR_, OUT_T_) \
   if (is_causal) { \
     hipLaunchKernelGGL((qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, false, true, OUT_T_>), grid, block, 0, stream, \
@@ -7814,8 +6376,8 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   } else { \
     SAGEATTN_LAUNCH_FP8_2Q_TV_OUT(BC_, HD_, BR_, __half); \
   }
-#define SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VGLOBAL_, VLANE_, STREAM_, KLANE_, KPREPACK_, GRID_, FLAT_, PERSIST_) \
-  hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, int8_t, false, int8_t, false, PVORDER_, VGLOBAL_, VLANE_, STREAM_, false, KLANE_, KPREPACK_, false, 64, false, false, false, false, false, FLAT_, PERSIST_>), GRID_, block, 0, stream, \
+#define SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, GRID_, FLAT_) \
+  hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, int8_t, false, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, 64, FLAT_>), GRID_, block, 0, stream, \
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
       reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
       reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -7828,38 +6390,14 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query_scale.stride(0), query_scale.stride(1), \
       key_scale.stride(0), key_scale.stride(1), \
       tensor_layout, sm_scale)
-#define SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, F16ACC_, PVORDER_, VGLOBAL_, VLANE_, STREAM_, KLANE_, KPREPACK_) \
-  if (use_f16_persistent_q_schedule) { \
-    SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VGLOBAL_, VLANE_, STREAM_, KLANE_, KPREPACK_, grid_f16_persistent, false, true); \
-  } else if (use_f16_flat_q_schedule) { \
-    SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VGLOBAL_, VLANE_, STREAM_, KLANE_, KPREPACK_, grid_f16_flat, true, false); \
+#define SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_) \
+  if (use_f16_flat_q_schedule) { \
+    SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, grid_f16_flat, true); \
   } else { \
-    SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VGLOBAL_, VLANE_, STREAM_, KLANE_, KPREPACK_, grid, false, false); \
-  }
-#define SAGEATTN_LAUNCH_F16_2Q_TV_CK_KEY_CAUSAL_GRID(BC_, BR_, PAD_, VLANE_, GRID_, FLAT_, PERSIST_) \
-  hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, true, int8_t, false, int8_t, false, true, false, VLANE_, false, false, false, false, false, 64, false, false, false, false, true, FLAT_, PERSIST_>), GRID_, block, 0, stream, \
-      query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
-      reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
-      reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
-      query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), \
-      batch, q_len, kv_len, q_heads, kv_heads, \
-      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
-      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
-      value.stride(0), value.stride(2), value.stride(1), \
-      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
-      query_scale.stride(0), query_scale.stride(1), \
-      key_scale.stride(0), key_scale.stride(1), \
-      tensor_layout, sm_scale)
-#define SAGEATTN_LAUNCH_F16_2Q_TV_CK_KEY_CAUSAL(BC_, BR_, PAD_, VLANE_) \
-  if (use_f16_persistent_q_schedule) { \
-    SAGEATTN_LAUNCH_F16_2Q_TV_CK_KEY_CAUSAL_GRID(BC_, BR_, PAD_, VLANE_, grid_f16_persistent, false, true); \
-  } else if (use_f16_flat_q_schedule) { \
-    SAGEATTN_LAUNCH_F16_2Q_TV_CK_KEY_CAUSAL_GRID(BC_, BR_, PAD_, VLANE_, grid_f16_flat, true, false); \
-  } else { \
-    SAGEATTN_LAUNCH_F16_2Q_TV_CK_KEY_CAUSAL_GRID(BC_, BR_, PAD_, VLANE_, grid, false, false); \
+    SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, grid, false); \
   }
 #define SAGEATTN_LAUNCH_F16_D16_2Q_TV(BC_, BR_, PAD_, CAUSAL_, F16ACC_) \
-  hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, CAUSAL_, false, F16ACC_, int8_t, false, int8_t, false, false, false, false, false, false, false, false, false, 16>), grid, block, 0, stream, \
+  hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, CAUSAL_, false, F16ACC_, int8_t, false, int8_t, false, false, false, false, false, 16>), grid, block, 0, stream, \
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
       reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
       reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -7876,36 +6414,21 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   if (is_causal) { \
     if (use_f16_pv_accum) { \
       if (use_f16_pv_ordered_qk) { \
-        if (use_f16_ck_key_layout && (BC_) == 64 && use_f16_vlane) { SAGEATTN_LAUNCH_F16_2Q_TV_CK_KEY_CAUSAL(BC_, BR_, PAD_, true); } \
-        else if (use_f16_ck_key_layout && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CK_KEY_CAUSAL(BC_, BR_, PAD_, false); } \
-        else if (use_f16_klane_prepack && use_f16_vglobal && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, true, false, false, false, true); } \
-        else if (use_f16_klane && use_f16_vglobal && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, true, false, false, true, false); } \
-        else if (use_f16_vglobal) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, true, false, false, false, false); } \
-        else if (use_f16_klane_prepack && use_f16_vlane && (BC_) == 64 && use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, true, true, false, true); } \
-        else if (use_f16_klane_prepack && use_f16_vlane && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, true, false, false, true); } \
-        else if (use_f16_klane_prepack && (BC_) == 64 && use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, false, true, false, true); } \
-        else if (use_f16_klane_prepack && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, false, false, false, true); } \
-        else if (use_f16_klane && use_f16_vlane && (BC_) == 64 && use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, true, true, true, false); } \
-        else if (use_f16_klane && use_f16_vlane && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, true, false, true, false); } \
-        else if (use_f16_klane && (BC_) == 64 && use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, false, true, true, false); } \
-        else if (use_f16_klane && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, false, false, true, false); } \
-        else if (use_f16_vlane && (BC_) == 64 && use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, true, true, false, false); } \
-        else if (use_f16_vlane && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, true, false, false, false); } \
-        else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, false, true, false, false); } \
-        else { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, false, false, false, false); } \
+        if (use_f16_vlane && (BC_) == 64 && use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, true, true, false); } \
+        else if (use_f16_vlane && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, true, false, false); } \
+        else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, true, false); } \
+        else { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, true, false, false, false); } \
       } else { \
-        if (use_f16_vglobal) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, false, true, false, false, false, false); } \
-        else if (use_f16_vlane && (BC_) == 64 && use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, false, false, true, true, false, false); } \
-        else if (use_f16_vlane && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, false, false, true, false, false, false); } \
-        else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, false, false, false, true, false, false); } \
-        else { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, false, false, false, false, false, false); } \
+        if (use_f16_vlane && (BC_) == 64 && use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, false, true, true, false); } \
+        else if (use_f16_vlane && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, false, true, false, false); } \
+        else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, false, false, true, false); } \
+        else { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, true, false, false, false, false); } \
       } \
     } else { \
-      if (use_f16_vglobal) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, false, false, true, false, false, false, false); } \
-      else if (use_f16_vlane && (BC_) == 64 && use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, false, false, false, true, true, false, false); } \
-      else if (use_f16_vlane && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, false, false, false, true, false, false, false); } \
-      else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, false, false, false, false, true, false, false); } \
-      else { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, false, false, false, false, false, false, false); } \
+      if (use_f16_vlane && (BC_) == 64 && use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, false, false, true, true, false); } \
+      else if (use_f16_vlane && (BC_) == 64) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, false, false, true, false, false); } \
+      else if (use_f16_streamk) { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, false, false, false, true, false); } \
+      else { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, false, false, false, false, false); } \
     } \
   } else { \
     hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_>), grid, block, 0, stream, \
@@ -8316,5 +6839,5 @@ torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
     float sm_scale) {
   return qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query, key, value, output, query_scale, key_scale, tensor_layout,
-      is_causal, sm_scale, false);
+      is_causal, sm_scale);
 }
