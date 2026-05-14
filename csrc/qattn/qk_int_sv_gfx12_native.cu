@@ -103,6 +103,11 @@ __device__ __forceinline__ int8_t float_to_int8_rn_gfx12(const float x) {
   return static_cast<int8_t>(rounded);
 }
 
+__device__ __forceinline__ int8_t float_to_int8_nearby_gfx12(const float x) {
+  const float clipped = fminf(127.0f, fmaxf(-128.0f, nearbyintf(x)));
+  return static_cast<int8_t>(clipped);
+}
+
 template <typename T, int HeadDim>
 __global__ void quant_qk_int8_hnd_kernel(
     const T* __restrict__ query,
@@ -190,6 +195,142 @@ __global__ void quant_qk_int8_hnd_kernel(
       out1.w = float_to_int8_rn_gfx12(value_to_float(values[7]) * inv_scale);
       *reinterpret_cast<char4*>(out + off) = out0;
       *reinterpret_cast<char4*>(out + off + 4) = out1;
+    }
+  }
+}
+
+template <typename T, int HeadDim>
+__global__ void quant_q_nhd_per_warp_kernel(
+    const T* __restrict__ query,
+    int8_t* __restrict__ query_out,
+    float* __restrict__ query_scale,
+    const int64_t batch,
+    const int64_t q_len,
+    const int64_t q_heads,
+    const int q_scale_groups) {
+  constexpr int Threads = 256;
+  constexpr int PackElems = 8;
+  constexpr int QRows = 32;
+  constexpr int GroupsPerBlock = 2;
+  static_assert((HeadDim % PackElems) == 0, "native Q quantization packs eight elements");
+
+  __shared__ float shared_amax[GroupsPerBlock];
+  __shared__ float shared_pair_amax[GroupsPerBlock][32];
+
+  const int group_base = static_cast<int>(blockIdx.x) * GroupsPerBlock;
+  const int head = blockIdx.y;
+  const int b = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int wid = tid >> 5;
+  if (b >= batch || head >= q_heads ||
+      static_cast<int64_t>(group_base) * QRows >= q_len) {
+    return;
+  }
+
+  constexpr int Packs = (QRows * HeadDim) / PackElems;
+  float local_amax0 = 0.0000001f;
+  float local_amax1 = 0.0000001f;
+  const bool has_group1 = (group_base + 1) < q_scale_groups;
+  const int64_t base_row0 = static_cast<int64_t>(group_base) * QRows;
+  const int64_t base_row1 = base_row0 + QRows;
+
+  for (int pack = tid; pack < Packs; pack += Threads) {
+    const int elem_base = pack * PackElems;
+    const int row = elem_base / HeadDim;
+    const int d = elem_base - row * HeadDim;
+    const int64_t seq0 = base_row0 + row;
+    if (seq0 < q_len) {
+      const int64_t off =
+          ((static_cast<int64_t>(b) * q_len + seq0) * q_heads + head) * HeadDim + d;
+      const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
+      const T* values = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+      for (int i = 0; i < PackElems; ++i) {
+        local_amax0 = fmaxf(local_amax0, fabsf(value_to_float(values[i])));
+      }
+    }
+    const int64_t seq1 = base_row1 + row;
+    if (has_group1 && seq1 < q_len) {
+      const int64_t off =
+          ((static_cast<int64_t>(b) * q_len + seq1) * q_heads + head) * HeadDim + d;
+      const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
+      const T* values = reinterpret_cast<const T*>(&raw);
+#pragma unroll
+      for (int i = 0; i < PackElems; ++i) {
+        local_amax1 = fmaxf(local_amax1, fabsf(value_to_float(values[i])));
+      }
+    }
+  }
+
+  local_amax0 = vllm::warpReduceMax(local_amax0);
+  local_amax1 = vllm::warpReduceMax(local_amax1);
+  if (lane == 0) {
+    shared_pair_amax[0][wid] = local_amax0;
+    shared_pair_amax[1][wid] = local_amax1;
+  }
+  __syncthreads();
+
+  const bool warp_lane_active = tid < (blockDim.x / 32);
+  local_amax0 = warp_lane_active ? shared_pair_amax[0][lane] : -1e20f;
+  local_amax1 = warp_lane_active ? shared_pair_amax[1][lane] : -1e20f;
+  local_amax0 = vllm::warpReduceMax(local_amax0);
+  local_amax1 = vllm::warpReduceMax(local_amax1);
+  if (tid == 0) {
+    shared_amax[0] = local_amax0;
+    query_scale[(static_cast<int64_t>(b) * q_heads + head) * q_scale_groups +
+                group_base] = local_amax0 / 127.0f;
+    if (has_group1) {
+      shared_amax[1] = local_amax1;
+      query_scale[(static_cast<int64_t>(b) * q_heads + head) * q_scale_groups +
+                  group_base + 1] = local_amax1 / 127.0f;
+    }
+  }
+  __syncthreads();
+
+  const float inv_scale0 = 127.0f / shared_amax[0];
+  const float inv_scale1 = has_group1 ? (127.0f / shared_amax[1]) : 0.0f;
+  for (int pack = tid; pack < Packs; pack += Threads) {
+    const int elem_base = pack * PackElems;
+    const int row = elem_base / HeadDim;
+    const int d = elem_base - row * HeadDim;
+    const int64_t seq0 = base_row0 + row;
+    if (seq0 < q_len) {
+      const int64_t off =
+          ((static_cast<int64_t>(b) * q_len + seq0) * q_heads + head) * HeadDim + d;
+      const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
+      const T* values = reinterpret_cast<const T*>(&raw);
+      char4 out0;
+      char4 out1;
+      out0.x = float_to_int8_nearby_gfx12(value_to_float(values[0]) * inv_scale0);
+      out0.y = float_to_int8_nearby_gfx12(value_to_float(values[1]) * inv_scale0);
+      out0.z = float_to_int8_nearby_gfx12(value_to_float(values[2]) * inv_scale0);
+      out0.w = float_to_int8_nearby_gfx12(value_to_float(values[3]) * inv_scale0);
+      out1.x = float_to_int8_nearby_gfx12(value_to_float(values[4]) * inv_scale0);
+      out1.y = float_to_int8_nearby_gfx12(value_to_float(values[5]) * inv_scale0);
+      out1.z = float_to_int8_nearby_gfx12(value_to_float(values[6]) * inv_scale0);
+      out1.w = float_to_int8_nearby_gfx12(value_to_float(values[7]) * inv_scale0);
+      *reinterpret_cast<char4*>(query_out + off) = out0;
+      *reinterpret_cast<char4*>(query_out + off + 4) = out1;
+    }
+    const int64_t seq1 = base_row1 + row;
+    if (has_group1 && seq1 < q_len) {
+      const int64_t off =
+          ((static_cast<int64_t>(b) * q_len + seq1) * q_heads + head) * HeadDim + d;
+      const uint4 raw = *reinterpret_cast<const uint4*>(query + off);
+      const T* values = reinterpret_cast<const T*>(&raw);
+      char4 out0;
+      char4 out1;
+      out0.x = float_to_int8_nearby_gfx12(value_to_float(values[0]) * inv_scale1);
+      out0.y = float_to_int8_nearby_gfx12(value_to_float(values[1]) * inv_scale1);
+      out0.z = float_to_int8_nearby_gfx12(value_to_float(values[2]) * inv_scale1);
+      out0.w = float_to_int8_nearby_gfx12(value_to_float(values[3]) * inv_scale1);
+      out1.x = float_to_int8_nearby_gfx12(value_to_float(values[4]) * inv_scale1);
+      out1.y = float_to_int8_nearby_gfx12(value_to_float(values[5]) * inv_scale1);
+      out1.z = float_to_int8_nearby_gfx12(value_to_float(values[6]) * inv_scale1);
+      out1.w = float_to_int8_nearby_gfx12(value_to_float(values[7]) * inv_scale1);
+      *reinterpret_cast<char4*>(query_out + off) = out0;
+      *reinterpret_cast<char4*>(query_out + off + 4) = out1;
     }
   }
 }
@@ -480,7 +621,7 @@ __device__ __forceinline__ i32x2_vec pack_quant_q_i8_wmma_b_regs(
 #pragma unroll
     for (int byte = 0; byte < 4; ++byte) {
       packed |= static_cast<uint32_t>(static_cast<unsigned char>(
-          float_to_int8_rn_gfx12(value_to_float(values[4 * gpr + byte]) * inv_q_scale)))
+          float_to_int8_nearby_gfx12(value_to_float(values[4 * gpr + byte]) * inv_q_scale)))
           << (8 * byte);
     }
     regs[gpr] = static_cast<int32_t>(packed);
@@ -2804,6 +2945,7 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
        (BlockCols == 64 || BlockCols == 128) &&
        ValueTransposed));
   constexpr bool UseStreamedFp8Pv =
+      StreamColsOverride >= 0 &&
       (BlockCols == 64 || (BlockCols == 128 && HeadDim == 128)) &&
       ValueTransposed &&
       (QuantizeQuery || (HeadDim == 128 && BlockCols == 128 &&
@@ -2811,10 +2953,8 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
       (HeadDim == 128 ||
        (HeadDim == 64 && IsCausal &&
         (UsePrepackedLaneMajorK || UsePrepackedLaneMajorValue)));
-  static_assert(!ValueTransposed || HndContiguous,
-                "transposed V path currently requires contiguous HND tensors.");
-  static_assert(!QuantizeQuery || HndContiguous,
-                "fused Q quantization currently supports contiguous HND tensors.");
+  static_assert(!PrepackedLaneMajorKV || HndContiguous,
+                "prepacked transposed fp8 K/V requires contiguous HND tensors.");
   static_assert(!QuantizeKeyValue ||
                     ((HeadDim == 64 || HeadDim == 128) &&
                      BlockCols == 64 && HndContiguous && !ValueTransposed),
@@ -5514,6 +5654,65 @@ torch::Tensor convert_f16_to_bf16_gfx12(torch::Tensor input) {
   return output;
 }
 
+std::vector<torch::Tensor> quant_q_nhd_per_warp_gfx12(torch::Tensor query) {
+  TORCH_CHECK(query.is_cuda(), "gfx12 NHD Q quantization expects a CUDA/HIP tensor");
+  TORCH_CHECK(query.dim() == 4, "gfx12 NHD Q quantization expects [B, S, H, D]");
+  TORCH_CHECK(query.is_contiguous(), "gfx12 NHD Q quantization expects contiguous NHD input");
+  TORCH_CHECK(query.scalar_type() == torch::kFloat16 || query.scalar_type() == torch::kBFloat16,
+              "gfx12 NHD Q quantization supports fp16/bf16 input");
+  const int64_t batch = query.size(0);
+  const int64_t q_len = query.size(1);
+  const int64_t q_heads = query.size(2);
+  const int64_t head_dim = query.size(3);
+  TORCH_CHECK(head_dim == 16 || head_dim == 64 || head_dim == 128,
+              "gfx12 NHD Q quantization supports head_dim 16, 64, or 128");
+  const int q_scale_groups = static_cast<int>(((q_len + 127) / 128) * 4);
+  torch::Tensor query_out = torch::empty_like(query, query.options().dtype(torch::kInt8));
+  torch::Tensor query_scale =
+      torch::empty({batch, q_heads, q_scale_groups}, query.options().dtype(torch::kFloat32));
+
+  const dim3 block(256);
+  const dim3 grid((q_scale_groups + 1) / 2, q_heads, batch);
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (query.scalar_type() == torch::kFloat16) {
+    if (head_dim == 16) {
+      quant_q_nhd_per_warp_kernel<__half, 16><<<grid, block, 0, stream>>>(
+          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
+          query_out.data_ptr<int8_t>(), query_scale.data_ptr<float>(),
+          batch, q_len, q_heads, q_scale_groups);
+    } else if (head_dim == 64) {
+      quant_q_nhd_per_warp_kernel<__half, 64><<<grid, block, 0, stream>>>(
+          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
+          query_out.data_ptr<int8_t>(), query_scale.data_ptr<float>(),
+          batch, q_len, q_heads, q_scale_groups);
+    } else {
+      quant_q_nhd_per_warp_kernel<__half, 128><<<grid, block, 0, stream>>>(
+          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
+          query_out.data_ptr<int8_t>(), query_scale.data_ptr<float>(),
+          batch, q_len, q_heads, q_scale_groups);
+    }
+  } else {
+    if (head_dim == 16) {
+      quant_q_nhd_per_warp_kernel<__hip_bfloat16, 16><<<grid, block, 0, stream>>>(
+          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
+          query_out.data_ptr<int8_t>(), query_scale.data_ptr<float>(),
+          batch, q_len, q_heads, q_scale_groups);
+    } else if (head_dim == 64) {
+      quant_q_nhd_per_warp_kernel<__hip_bfloat16, 64><<<grid, block, 0, stream>>>(
+          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
+          query_out.data_ptr<int8_t>(), query_scale.data_ptr<float>(),
+          batch, q_len, q_heads, q_scale_groups);
+    } else {
+      quant_q_nhd_per_warp_kernel<__hip_bfloat16, 128><<<grid, block, 0, stream>>>(
+          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
+          query_out.data_ptr<int8_t>(), query_scale.data_ptr<float>(),
+          batch, q_len, q_heads, q_scale_groups);
+    }
+  }
+  hip_kernel_launch_check();
+  return {query_out, query_scale};
+}
+
 std::vector<torch::Tensor> quant_qk_int8_hnd_gfx12(torch::Tensor query, torch::Tensor key) {
   TORCH_CHECK(query.is_cuda() && key.is_cuda(), "gfx12 Q/K quantization expects CUDA/HIP tensors");
   TORCH_CHECK(query.dim() == 4 && key.dim() == 4, "gfx12 Q/K quantization expects [B, H, S, D]");
@@ -6868,6 +7067,171 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   }
   hip_kernel_launch_check();
   return torch::empty({0}, query.options().dtype(torch::kFloat32));
+}
+
+torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor output,
+    torch::Tensor key_scale,
+    int tensor_layout,
+    int is_causal,
+    float sm_scale,
+    int64_t valid_kv_len) {
+  TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && output.is_cuda(),
+              "raw-Q gfx12 tensors must be CUDA/HIP tensors");
+  TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4 && output.dim() == 4,
+              "raw-Q gfx12 attention expects 4D Q/K/V/O tensors");
+  TORCH_CHECK(query.scalar_type() == torch::kFloat16 ||
+                  query.scalar_type() == torch::kBFloat16,
+              "raw-Q gfx12 attention supports fp16/bf16 query");
+  TORCH_CHECK(key.scalar_type() == torch::kInt8,
+              "raw-Q gfx12 attention expects pre-quantized int8 key");
+  TORCH_CHECK(value.scalar_type() == torch::kByte,
+              "raw-Q gfx12 attention expects raw OCP e4m3 fp8 value bytes");
+  TORCH_CHECK(output.scalar_type() == torch::kFloat16 ||
+                  output.scalar_type() == torch::kBFloat16,
+              "raw-Q gfx12 attention output must be fp16 or bf16");
+  TORCH_CHECK(key_scale.scalar_type() == torch::kFloat32,
+              "raw-Q gfx12 attention key_scale must be fp32");
+  TORCH_CHECK(tensor_layout == kHND || tensor_layout == kNHD, "invalid tensor_layout");
+  TORCH_CHECK(query.is_contiguous() && key.is_contiguous() &&
+                  value.is_contiguous() && output.is_contiguous(),
+              "raw-Q gfx12 attention expects contiguous tensors");
+
+  const int64_t head_dim = query.size(-1);
+  TORCH_CHECK(head_dim == 16 || head_dim == 64 || head_dim == 128,
+              "raw-Q gfx12 fp8 path supports head_dim 16, 64, or 128");
+  const int64_t batch = query.size(0);
+  const int64_t q_heads = tensor_layout == kNHD ? query.size(2) : query.size(1);
+  const int64_t q_len = tensor_layout == kNHD ? query.size(1) : query.size(2);
+  const int64_t out_q_len = tensor_layout == kNHD ? output.size(1) : output.size(2);
+  const int64_t kv_heads = tensor_layout == kNHD ? key.size(2) : key.size(1);
+  const int64_t padded_kv_len = tensor_layout == kNHD ? key.size(1) : key.size(2);
+  const int64_t kv_len = valid_kv_len > 0 ? valid_kv_len : padded_kv_len;
+  TORCH_CHECK(kv_len > 0 && kv_len <= padded_kv_len,
+              "valid_kv_len must be in (0, padded_kv_len]");
+  TORCH_CHECK(key.size(0) == batch && value.size(0) == batch &&
+                  output.size(0) == batch,
+              "raw-Q gfx12 batch size mismatch");
+  const bool value_transposed_hnd =
+      value.size(1) == kv_heads && value.size(2) == head_dim &&
+      value.size(3) >= padded_kv_len;
+  TORCH_CHECK(key.size(-1) == head_dim && output.size(-1) == head_dim &&
+                  (value_transposed_hnd || value.size(-1) == head_dim),
+              "raw-Q gfx12 Q/K/V/O head_dim mismatch");
+  TORCH_CHECK((tensor_layout == kNHD &&
+                   ((value_transposed_hnd && output.size(1) >= q_len &&
+                     key.size(2) == kv_heads && output.size(2) == q_heads) ||
+                    (!value_transposed_hnd && value.size(1) == padded_kv_len &&
+                     output.size(1) >= q_len && key.size(2) == kv_heads &&
+                     value.size(2) == kv_heads && output.size(2) == q_heads))) ||
+                  (tensor_layout == kHND &&
+                   ((value_transposed_hnd && output.size(2) >= q_len &&
+                     key.size(1) == kv_heads && output.size(1) == q_heads) ||
+                    (!value_transposed_hnd && value.size(2) == padded_kv_len &&
+                     output.size(2) >= q_len && key.size(1) == kv_heads &&
+                     value.size(1) == kv_heads && output.size(1) == q_heads))),
+              "raw-Q gfx12 Q/K/V/O shape mismatch");
+  TORCH_CHECK((q_heads % kv_heads) == 0, "q_heads must be divisible by kv_heads");
+  TORCH_CHECK((padded_kv_len % 64) == 0,
+              "raw-Q gfx12 attention requires padded kv_len divisible by 64");
+  TORCH_CHECK(!is_causal || (q_len % 64) == 0,
+              "raw-Q gfx12 causal attention requires q_len divisible by 64");
+  TORCH_CHECK(!is_causal || q_len == padded_kv_len,
+              "raw-Q gfx12 causal attention requires q_len == padded_kv_len");
+  TORCH_CHECK(key_scale.stride(-1) == 1, "key_scale must have contiguous scale columns");
+
+  int block_rows = head_dim == 64 ?
+      select_fp8_d64_block_rows_gfx12(q_len, is_causal, false) :
+      (q_len <= 64 ? 64 : 128);
+  if (head_dim == 64 && !is_causal && q_len == 1024) {
+    block_rows = 128;
+  }
+  if (head_dim == 16 && is_causal && q_len <= 1024) {
+    block_rows = 64;
+  }
+  const int64_t q_blocks = (q_len + block_rows - 1) / block_rows;
+  TORCH_CHECK(out_q_len >= q_blocks * block_rows,
+              "raw-Q gfx12 attention output must cover the padded query tail");
+
+  constexpr int block_cols = 64;
+  const bool hnd_contiguous = tensor_layout == kHND;
+  const dim3 block(block_rows);
+  const dim3 grid(q_blocks, q_heads, batch);
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+
+#define SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(HD_, HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_) \
+  qk_int8_sv_f8_native_2q_kernel<block_cols, HD_, 0, ((HD_) / 16), HND_, BR_, VT_, CAUSAL_, OUT_T_, QUERY_T_, true, int8_t, uint8_t, false, false, (VT_ ? -1 : 0), false, false, 2, false><<<grid, block, 0, stream>>>( \
+      reinterpret_cast<const QUERY_T_*>(query.data_ptr<QUERY_AT_T_>()), \
+      key.data_ptr<int8_t>(), value.data_ptr<uint8_t>(), \
+      reinterpret_cast<OUT_T_*>(output.data_ptr<OUT_AT_T_>()), \
+      nullptr, key_scale.data_ptr<float>(), \
+      batch, q_len, kv_len, q_heads, kv_heads, \
+      query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+      key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+      value.stride(0), (VT_ ? value.stride(2) : value.stride(tensor_layout == kNHD ? 1 : 2)), (VT_ ? value.stride(1) : value.stride(tensor_layout == kNHD ? 2 : 1)), \
+      output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+      0, 0, \
+      key_scale.stride(0), key_scale.stride(1), \
+      tensor_layout, sm_scale)
+#define SAGEATTN_DISPATCH_RAWQ_FP8_OUT(HD_, HND_, BR_, VT_, CAUSAL_, QUERY_T_, QUERY_AT_T_) \
+  if (output.scalar_type() == torch::kBFloat16) { \
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(HD_, HND_, BR_, VT_, CAUSAL_, QUERY_T_, __hip_bfloat16, QUERY_AT_T_, at::BFloat16); \
+  } else { \
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED(HD_, HND_, BR_, VT_, CAUSAL_, QUERY_T_, __half, QUERY_AT_T_, at::Half); \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, BR_, VT_, CAUSAL_) \
+  if (query.scalar_type() == torch::kBFloat16) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_OUT(HD_, HND_, BR_, VT_, CAUSAL_, __hip_bfloat16, at::BFloat16); \
+  } else { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_OUT(HD_, HND_, BR_, VT_, CAUSAL_, __half, at::Half); \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_FP8_BR(HD_, HND_, VT_, CAUSAL_) \
+  if (block_rows == 64) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, 64, VT_, CAUSAL_); \
+  } else if (block_rows == 256) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, 256, VT_, CAUSAL_); \
+  } else if (block_rows == 512) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, 512, VT_, CAUSAL_); \
+  } else { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_QUERY(HD_, HND_, 128, VT_, CAUSAL_); \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_FP8_HD(HND_, VT_, CAUSAL_) \
+  if (head_dim == 16) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR(16, HND_, VT_, CAUSAL_); \
+  } else if (head_dim == 64) { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR(64, HND_, VT_, CAUSAL_); \
+  } else { \
+    SAGEATTN_DISPATCH_RAWQ_FP8_BR(128, HND_, VT_, CAUSAL_); \
+  }
+
+  if (hnd_contiguous) {
+    if (is_causal) {
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(true, true, true); }
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(true, false, true); }
+    } else {
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(true, true, false); }
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(true, false, false); }
+    }
+  } else {
+    if (is_causal) {
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(false, true, true); }
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(false, false, true); }
+    } else {
+      if (value_transposed_hnd) { SAGEATTN_DISPATCH_RAWQ_FP8_HD(false, true, false); }
+      else { SAGEATTN_DISPATCH_RAWQ_FP8_HD(false, false, false); }
+    }
+  }
+
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_HD
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_BR
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_QUERY
+#undef SAGEATTN_DISPATCH_RAWQ_FP8_OUT
+#undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED
+  hip_kernel_launch_check();
+  return output;
 }
 
 torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12(

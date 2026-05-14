@@ -60,6 +60,7 @@ from .quant import per_block_int8 as per_block_int8_cuda
 from .quant import per_warp_int8 as per_warp_int8_cuda
 from .quant import sub_mean
 from .quant import per_channel_fp8
+from .quant import _fused as _quant_fused
 
 from typing import Any, List, Literal, Optional, Tuple, Union
 import warnings
@@ -133,6 +134,30 @@ def _pad_gfx12_hnd_sequence(
     return q_hnd, k_hnd, v_hnd
 
 
+def _pad_gfx12_nhd_sequence(
+    q_nhd: torch.Tensor,
+    k_nhd: torch.Tensor,
+    v_nhd: torch.Tensor,
+    q_len: int,
+    kv_len: int,
+    is_causal: bool = False,
+    k_pad_value: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    q_padded_len = _round_up_to_multiple(q_len, 128)
+    kv_padded_len = q_padded_len if is_causal else _round_up_to_multiple(kv_len, 64)
+    q_pad_len = q_padded_len - q_len
+    kv_pad_len = kv_padded_len - kv_len
+    if q_pad_len > 0:
+        q_nhd = F.pad(q_nhd, (0, 0, 0, 0, 0, q_pad_len))
+    if kv_pad_len > 0:
+        if k_pad_value is None:
+            k_nhd = F.pad(k_nhd, (0, 0, 0, 0, 0, kv_pad_len))
+        else:
+            k_nhd = torch.cat([k_nhd, k_pad_value.expand(-1, kv_pad_len, -1, -1)], dim=1)
+        v_nhd = F.pad(v_nhd, (0, 0, 0, 0, 0, kv_pad_len))
+    return q_nhd, k_nhd, v_nhd
+
+
 def sageattn_qk_int8_pv_gfx12_native(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -148,8 +173,9 @@ def sageattn_qk_int8_pv_gfx12_native(
     """
     ROCm gfx12 native SageAttention path.
 
-    Supports fixed-length attention, with NHD inputs internally converted to
-    the HND-contiguous native execution layout.
+    Supports fixed-length attention. The default smooth-K path follows the
+    CUDA quantization flow; NHD inputs use native NHD quantization to avoid an
+    extra layout conversion when possible.
 
     Current gfx12 constraints:
     - q, k, and v must be fp16 or bf16.
@@ -157,8 +183,6 @@ def sageattn_qk_int8_pv_gfx12_native(
     - value_dtype="fp16" supports head_dim 16 or 64.
     - Causal masking requires q_len == kv_len.
     - smooth_k is enabled by default to match the CUDA and Triton paths.
-      head_dim=16 keeps the existing non-smooth path because the fused
-      smoothing quantizer supports head_dim 64/128.
     - return_lse is not implemented yet.
     """
 
@@ -277,6 +301,107 @@ def sageattn_qk_int8_pv_gfx12_native(
             return out if out.dtype == torch.bfloat16 else gfx12_native.convert_f16_to_bf16(out)
         return out
 
+    if tensor_layout == "NHD" and smooth_k:
+        q_nhd = q.contiguous()
+        k_nhd = k.contiguous()
+        v_nhd = v.contiguous()
+
+        _, qo_len, h_qo, head_dim_og = q_nhd.shape
+        _, kv_len, h_kv, _ = k_nhd.shape
+        if h_qo % h_kv != 0:
+            raise ValueError("num_qo_heads must be divisible by num_kv_heads.")
+        if is_causal and qo_len != kv_len:
+            raise ValueError("gfx12 causal path currently requires q_len == kv_len.")
+
+        head_dim = head_dim_og
+        if head_dim < 64:
+            pad = 64 - head_dim
+            q_nhd = F.pad(q_nhd, (0, pad))
+            k_nhd = F.pad(k_nhd, (0, pad))
+            v_nhd = F.pad(v_nhd, (0, pad))
+            head_dim = 64
+        elif value_dtype == "fp8" and 64 < head_dim < 128:
+            pad = 128 - head_dim
+            q_nhd = F.pad(q_nhd, (0, pad))
+            k_nhd = F.pad(k_nhd, (0, pad))
+            v_nhd = F.pad(v_nhd, (0, pad))
+            head_dim = 128
+
+        if value_dtype == "fp16" and head_dim not in (16, 64):
+            raise ValueError("gfx12 fp16 value path currently supports head_dim 16 or 64.")
+        if value_dtype == "fp8" and head_dim not in (16, 64, 128):
+            raise ValueError("gfx12 fp8 value path currently supports head_dim 16, 64, or 128.")
+
+        k_mean = k_nhd.mean(dim=1, keepdim=True)
+        use_rawq_tail = value_dtype == "fp8" and not is_causal and head_dim == 128
+        if use_rawq_tail:
+            q_attn = q_nhd
+            q_out_len = ((qo_len + 127) // 128) * 128
+            kv_pad_len = ((kv_len + 63) // 64) * 64 - kv_len
+            if kv_pad_len > 0:
+                k_nhd = torch.cat([k_nhd, k_mean.expand(-1, kv_pad_len, -1, -1)], dim=1)
+                v_nhd = F.pad(v_nhd, (0, 0, 0, 0, 0, kv_pad_len))
+        else:
+            q_nhd, k_nhd, v_nhd = _pad_gfx12_nhd_sequence(
+                q_nhd, k_nhd, v_nhd, qo_len, kv_len, bool(is_causal), k_mean
+            )
+            q_attn = q_nhd
+            q_out_len = q_nhd.size(1)
+        k_int8 = torch.empty_like(k_nhd, dtype=torch.int8)
+        k_scale = torch.empty(
+            (k_nhd.size(0), k_nhd.size(2), (k_nhd.size(1) + 63) // 64),
+            device=k_nhd.device,
+            dtype=torch.float32,
+        )
+        _quant_fused.quant_per_block_int8_fuse_sub_mean_cuda(
+            k_nhd, k_mean.squeeze(1), k_int8, k_scale, 64, 0
+        )
+        if value_dtype == "fp8" and not is_causal and head_dim == 128:
+            value_native = gfx12_native.transpose_value_fp8_hnd(
+                v_nhd.transpose(1, 2).contiguous()
+            )
+        elif value_dtype == "fp8":
+            value_native = v_nhd.to(torch.float8_e4m3fn).view(torch.uint8)
+        else:
+            value_native = v_nhd
+        out = torch.empty(
+            (q_nhd.size(0), q_out_len, q_nhd.size(2), q_nhd.size(3)),
+            device=q_nhd.device,
+            dtype=torch.float16,
+        )
+        if value_dtype == "fp8":
+            gfx12_native.qk_rawq_int8_sv_f8_native_attn(
+                q_attn,
+                k_int8,
+                value_native,
+                out,
+                k_scale,
+                0,
+                int(is_causal),
+                float(sm_scale),
+                kv_len,
+            )
+        else:
+            q_int8, q_scale = gfx12_native.quant_q_nhd_per_warp(q_attn)
+            gfx12_native.qk_int8_sv_f16_d64_native_attn(
+                q_int8,
+                k_int8,
+                value_native,
+                out,
+                q_scale,
+                k_scale,
+                0,
+                int(is_causal),
+                float(sm_scale),
+                kv_len,
+            )
+        out = out[:, :qo_len, :, :head_dim_og]
+        if input_dtype == torch.bfloat16 and out.dtype != torch.bfloat16:
+            out = gfx12_native.convert_f16_to_bf16(out.contiguous() if not out.is_contiguous() else out)
+        elif input_dtype != torch.float16:
+            out = out.to(input_dtype)
+        return out
+
     if tensor_layout == "NHD":
         q_hnd = q.transpose(1, 2).contiguous()
         k_hnd = k.transpose(1, 2).contiguous()
@@ -294,7 +419,7 @@ def sageattn_qk_int8_pv_gfx12_native(
         raise ValueError("gfx12 causal path currently requires q_len == kv_len.")
 
     head_dim = head_dim_og
-    if head_dim < 64 and head_dim != 16:
+    if head_dim < 64 and (smooth_k or head_dim != 16):
         pad = 64 - head_dim
         q_hnd = F.pad(q_hnd, (0, pad))
         k_hnd = F.pad(k_hnd, (0, pad))
@@ -311,9 +436,6 @@ def sageattn_qk_int8_pv_gfx12_native(
         raise ValueError("gfx12 fp16 value path currently supports head_dim 16 or 64.")
     if value_dtype == "fp8" and head_dim not in (16, 64, 128):
         raise ValueError("gfx12 fp8 value path currently supports head_dim 16, 64, or 128.")
-
-    if head_dim == 16:
-        smooth_k = False
 
     k_mean = k_hnd.mean(dim=2, keepdim=True) if smooth_k else None
     q_hnd, k_hnd, v_hnd = _pad_gfx12_hnd_sequence(
