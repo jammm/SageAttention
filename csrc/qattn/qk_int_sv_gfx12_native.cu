@@ -256,14 +256,12 @@ torch::Tensor transpose_value_hnd_gfx12(torch::Tensor value) {
   dim3 grid((seq_len + 127) / 128, (head_dim + 15) / 16, batch * heads);
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   if (value.scalar_type() == torch::kFloat16) {
-    hipLaunchKernelGGL((transpose_value_hnd_kernel<__half, OutT, ToFp8>),
-                       grid, block, 0, stream,
+    transpose_value_hnd_kernel<__half, OutT, ToFp8><<<grid, block, 0, stream>>>(
                        reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
                        reinterpret_cast<OutT*>(output.data_ptr()),
                        batch * heads, seq_len, head_dim);
   } else {
-    hipLaunchKernelGGL((transpose_value_hnd_kernel<__hip_bfloat16, OutT, ToFp8>),
-                       grid, block, 0, stream,
+    transpose_value_hnd_kernel<__hip_bfloat16, OutT, ToFp8><<<grid, block, 0, stream>>>(
                        reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
                        reinterpret_cast<OutT*>(output.data_ptr()),
                        batch * heads, seq_len, head_dim);
@@ -4796,8 +4794,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   if (query.scalar_type() == torch::kFloat16) {
     if (head_dim == 16) {
-      hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 16, 256>),
-                         grid, block, 0, stream,
+      prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 16, 256><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
@@ -4807,8 +4804,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                          fuse_self_qkv);
     } else if (head_dim == 64) {
-      hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 64, D64PrepThreads>),
-                         grid, block, 0, stream,
+      prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 64, D64PrepThreads><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
@@ -4819,10 +4815,9 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
                          fuse_self_qkv);
     } else {
       if (use_qkv_static_1024) {
-        hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 128, 256,
+        prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 128, 256,
                                                    true, true, false, false, false,
-                                                   true, 1024, 1024>),
-                           grid, block, 0, stream,
+                                                   true, 1024, 1024><<<grid, block, 0, stream>>>(
                            reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
@@ -4832,8 +4827,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
                            batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                            true);
       } else {
-        hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 128>),
-                           grid, block, 0, stream,
+        prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 128><<<grid, block, 0, stream>>>(
                            reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
@@ -4846,8 +4840,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
     }
   } else {
     if (head_dim == 16) {
-      hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 16, 256>),
-                         grid, block, 0, stream,
+      prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 16, 256><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
@@ -4857,8 +4850,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                          fuse_self_qkv);
     } else if (head_dim == 64) {
-      hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 64, D64PrepThreads>),
-                         grid, block, 0, stream,
+      prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 64, D64PrepThreads><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
@@ -4869,10 +4861,9 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
                          fuse_self_qkv);
     } else {
       if (use_qkv_static_1024) {
-        hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 128, 256,
+        prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 128, 256,
                                                    true, true, false, false, false,
-                                                   true, 1024, 1024>),
-                           grid, block, 0, stream,
+                                                   true, 1024, 1024><<<grid, block, 0, stream>>>(
                            reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
@@ -4882,8 +4873,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
                            batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                            true);
       } else {
-        hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 128>),
-                           grid, block, 0, stream,
+        prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 128><<<grid, block, 0, stream>>>(
                            reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
@@ -5003,8 +4993,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_packed_gfx12(
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   if (query.scalar_type() == torch::kFloat16) {
     if (head_dim == 16) {
-      hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 16, 256, TransposeValue, true>),
-                         grid, block, 0, stream,
+      prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 16, 256, TransposeValue, true><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
@@ -5013,8 +5002,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_packed_gfx12(
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                          fuse_self_qkv);
     } else if (head_dim == 64) {
-      hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 64, D64PrepThreads, TransposeValue, true, false, PrepackF16KLane, PrepackFp8Lane>),
-                         grid, block, 0, stream,
+      prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 64, D64PrepThreads, TransposeValue, true, false, PrepackF16KLane, PrepackFp8Lane><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
@@ -5023,8 +5011,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_packed_gfx12(
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                          fuse_self_qkv);
     } else {
-      hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 128, 256, TransposeValue, true, false, false, PrepackFp8Lane>),
-                         grid, block, 0, stream,
+      prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 128, 256, TransposeValue, true, false, false, PrepackFp8Lane><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
@@ -5035,8 +5022,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_packed_gfx12(
     }
   } else {
     if (head_dim == 16) {
-      hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 16, 256, TransposeValue, true>),
-                         grid, block, 0, stream,
+      prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 16, 256, TransposeValue, true><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
@@ -5045,8 +5031,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_packed_gfx12(
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                          fuse_self_qkv);
     } else if (head_dim == 64) {
-      hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 64, D64PrepThreads, TransposeValue, true, false, PrepackF16KLane, PrepackFp8Lane>),
-                         grid, block, 0, stream,
+      prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 64, D64PrepThreads, TransposeValue, true, false, PrepackF16KLane, PrepackFp8Lane><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
@@ -5055,8 +5040,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_packed_gfx12(
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                          fuse_self_qkv);
     } else {
-      hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 128, 256, TransposeValue, true, false, false, PrepackFp8Lane>),
-                         grid, block, 0, stream,
+      prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 128, 256, TransposeValue, true, false, false, PrepackFp8Lane><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
@@ -5184,8 +5168,7 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
       !PrepackFp8VLane && !PrepackFp8KLane;
   if (query.scalar_type() == torch::kFloat16) {
     if (head_dim == 16) {
-      hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 16, 256, TransposeValue, false>),
-                         grid, block, 0, stream,
+      prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 16, 256, TransposeValue, false><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
@@ -5196,15 +5179,13 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
       if constexpr (ToFp8 && TransposeValue) {
         if (use_kv1) {
           if (use_kv_static_1024) {
-            hipLaunchKernelGGL((prepare_kv_hnd_fp8_kernel<__half, 1, false, PrepackFp8Lane, 64, false, false, false, true, 256, 1024>),
-                               grid, block, 0, stream,
+            prepare_kv_hnd_fp8_kernel<__half, 1, false, PrepackFp8Lane, 64, false, false, false, true, 256, 1024><<<grid, block, 0, stream>>>(
                                reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                                reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
                                key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
                                batch, kv_heads, kv_len, k_groups);
           } else {
-            hipLaunchKernelGGL((prepare_kv_hnd_fp8_kernel<__half, 1, false, PrepackFp8Lane>),
-                               grid, block, 0, stream,
+            prepare_kv_hnd_fp8_kernel<__half, 1, false, PrepackFp8Lane><<<grid, block, 0, stream>>>(
                                reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                                reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
                                key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
@@ -5212,16 +5193,14 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
           }
         } else {
           const dim3 grid_kv((k_groups + 1) / 2, kv_heads, batch);
-          hipLaunchKernelGGL((prepare_kv_hnd_fp8_kernel<__half, 2, false, PrepackFp8Lane>),
-                             grid_kv, block, 0, stream,
+          prepare_kv_hnd_fp8_kernel<__half, 2, false, PrepackFp8Lane><<<grid_kv, block, 0, stream>>>(
                              reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                              reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
                              key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
                              batch, kv_heads, kv_len, k_groups);
         }
       } else {
-        hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 64, D64PrepThreads, TransposeValue, false, PrepackF16VLane, PrepackF16KLane>),
-                           grid, block, 0, stream,
+        prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 64, D64PrepThreads, TransposeValue, false, PrepackF16VLane, PrepackF16KLane><<<grid, block, 0, stream>>>(
                            reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
@@ -5233,15 +5212,13 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
       if constexpr (ToFp8 && TransposeValue) {
         if (use_kv1) {
           if (use_kv_static_1024) {
-            hipLaunchKernelGGL((prepare_kv_hnd_fp8_kernel<__half, 1, false, false, 128, false, false, false, true, 256, 1024>),
-                               grid, block, 0, stream,
+            prepare_kv_hnd_fp8_kernel<__half, 1, false, false, 128, false, false, false, true, 256, 1024><<<grid, block, 0, stream>>>(
                                reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                                reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
                                key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
                                batch, kv_heads, kv_len, k_groups);
           } else {
-            hipLaunchKernelGGL((prepare_kv_hnd_fp8_kernel<__half, 1, false, false, 128>),
-                               grid, block, 0, stream,
+            prepare_kv_hnd_fp8_kernel<__half, 1, false, false, 128><<<grid, block, 0, stream>>>(
                                reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                                reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
                                key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
@@ -5249,16 +5226,14 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
           }
         } else {
           const dim3 grid_kv((k_groups + 1) / 2, kv_heads, batch);
-          hipLaunchKernelGGL((prepare_kv_hnd_fp8_kernel<__half, 2, false, false, 128>),
-                             grid_kv, block, 0, stream,
+          prepare_kv_hnd_fp8_kernel<__half, 2, false, false, 128><<<grid_kv, block, 0, stream>>>(
                              reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                              reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
                              key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
                              batch, kv_heads, kv_len, k_groups);
         }
       } else {
-        hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 128, 256, TransposeValue, false>),
-                           grid, block, 0, stream,
+        prepare_qkv_hnd_kernel<__half, OutT, ToFp8, 128, 256, TransposeValue, false><<<grid, block, 0, stream>>>(
                            reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
@@ -5269,8 +5244,7 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
     }
   } else {
     if (head_dim == 16) {
-      hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 16, 256, TransposeValue, false>),
-                         grid, block, 0, stream,
+      prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 16, 256, TransposeValue, false><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
@@ -5281,15 +5255,13 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
       if constexpr (ToFp8 && TransposeValue) {
         if (use_kv1) {
           if (use_kv_static_1024) {
-            hipLaunchKernelGGL((prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 1, false, PrepackFp8Lane, 64, false, false, false, true, 256, 1024>),
-                               grid, block, 0, stream,
+            prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 1, false, PrepackFp8Lane, 64, false, false, false, true, 256, 1024><<<grid, block, 0, stream>>>(
                                reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                                reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
                                key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
                                batch, kv_heads, kv_len, k_groups);
           } else {
-            hipLaunchKernelGGL((prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 1, false, PrepackFp8Lane>),
-                               grid, block, 0, stream,
+            prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 1, false, PrepackFp8Lane><<<grid, block, 0, stream>>>(
                                reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                                reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
                                key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
@@ -5297,16 +5269,14 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
           }
         } else {
           const dim3 grid_kv((k_groups + 1) / 2, kv_heads, batch);
-          hipLaunchKernelGGL((prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 2, false, PrepackFp8Lane>),
-                             grid_kv, block, 0, stream,
+          prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 2, false, PrepackFp8Lane><<<grid_kv, block, 0, stream>>>(
                              reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                              reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
                              key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
                              batch, kv_heads, kv_len, k_groups);
         }
       } else {
-        hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 64, D64PrepThreads, TransposeValue, false, PrepackF16VLane, PrepackF16KLane>),
-                           grid, block, 0, stream,
+        prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 64, D64PrepThreads, TransposeValue, false, PrepackF16VLane, PrepackF16KLane><<<grid, block, 0, stream>>>(
                            reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
@@ -5318,15 +5288,13 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
       if constexpr (ToFp8 && TransposeValue) {
         if (use_kv1) {
           if (use_kv_static_1024) {
-            hipLaunchKernelGGL((prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 1, false, false, 128, false, false, false, true, 256, 1024>),
-                               grid, block, 0, stream,
+            prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 1, false, false, 128, false, false, false, true, 256, 1024><<<grid, block, 0, stream>>>(
                                reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                                reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
                                key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
                                batch, kv_heads, kv_len, k_groups);
           } else {
-            hipLaunchKernelGGL((prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 1, false, false, 128>),
-                               grid, block, 0, stream,
+            prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 1, false, false, 128><<<grid, block, 0, stream>>>(
                                reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                                reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
                                key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
@@ -5334,16 +5302,14 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
           }
         } else {
           const dim3 grid_kv((k_groups + 1) / 2, kv_heads, batch);
-          hipLaunchKernelGGL((prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 2, false, false, 128>),
-                             grid_kv, block, 0, stream,
+          prepare_kv_hnd_fp8_kernel<__hip_bfloat16, 2, false, false, 128><<<grid_kv, block, 0, stream>>>(
                              reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                              reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
                              key_ptr, key_scale_ptr, reinterpret_cast<uint8_t*>(value_ptr),
                              batch, kv_heads, kv_len, k_groups);
         }
       } else {
-        hipLaunchKernelGGL((prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 128, 256, TransposeValue, false>),
-                           grid, block, 0, stream,
+        prepare_qkv_hnd_kernel<__hip_bfloat16, OutT, ToFp8, 128, 256, TransposeValue, false><<<grid, block, 0, stream>>>(
                            reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
@@ -5468,24 +5434,24 @@ std::vector<torch::Tensor> prepare_k_hnd_packed_gfx12(torch::Tensor key) {
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   if (key.scalar_type() == torch::kFloat16) {
     if (head_dim == 64) {
-      hipLaunchKernelGGL((prepare_k_hnd_kernel<__half, 64, Threads>), grid, block, 0, stream,
+      prepare_k_hnd_kernel<__half, 64, Threads><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          key_ptr, scale_workspace.data_ptr<float>(),
                          batch, kv_heads, kv_len, k_groups);
     } else {
-      hipLaunchKernelGGL((prepare_k_hnd_kernel<__half, 128, Threads>), grid, block, 0, stream,
+      prepare_k_hnd_kernel<__half, 128, Threads><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          key_ptr, scale_workspace.data_ptr<float>(),
                          batch, kv_heads, kv_len, k_groups);
     }
   } else {
     if (head_dim == 64) {
-      hipLaunchKernelGGL((prepare_k_hnd_kernel<__hip_bfloat16, 64, Threads>), grid, block, 0, stream,
+      prepare_k_hnd_kernel<__hip_bfloat16, 64, Threads><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          key_ptr, scale_workspace.data_ptr<float>(),
                          batch, kv_heads, kv_len, k_groups);
     } else {
-      hipLaunchKernelGGL((prepare_k_hnd_kernel<__hip_bfloat16, 128, Threads>), grid, block, 0, stream,
+      prepare_k_hnd_kernel<__hip_bfloat16, 128, Threads><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          key_ptr, scale_workspace.data_ptr<float>(),
                          batch, kv_heads, kv_len, k_groups);
@@ -5540,7 +5506,7 @@ torch::Tensor convert_f16_to_bf16_gfx12(torch::Tensor input) {
   const dim3 block(threads);
   const dim3 grid((numel + threads * 2 - 1) / (threads * 2));
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-  hipLaunchKernelGGL(convert_f16_to_bf16_kernel, grid, block, 0, stream,
+  convert_f16_to_bf16_kernel<<<grid, block, 0, stream>>>(
                      reinterpret_cast<const __half*>(input.data_ptr<at::Half>()),
                      reinterpret_cast<__hip_bfloat16*>(output.data_ptr<at::BFloat16>()),
                      numel);
@@ -5582,21 +5548,21 @@ std::vector<torch::Tensor> quant_qk_int8_hnd_gfx12(torch::Tensor query, torch::T
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   if (query.scalar_type() == torch::kFloat16) {
     if (head_dim == 16) {
-      hipLaunchKernelGGL((quant_qk_int8_hnd_kernel<__half, 16>), grid, block, 0, stream,
+      quant_qk_int8_hnd_kernel<__half, 16><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
                          query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups);
     } else if (head_dim == 64) {
-      hipLaunchKernelGGL((quant_qk_int8_hnd_kernel<__half, 64>), grid, block, 0, stream,
+      quant_qk_int8_hnd_kernel<__half, 64><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
                          query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups);
     } else {
-      hipLaunchKernelGGL((quant_qk_int8_hnd_kernel<__half, 128>), grid, block, 0, stream,
+      quant_qk_int8_hnd_kernel<__half, 128><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
@@ -5605,21 +5571,21 @@ std::vector<torch::Tensor> quant_qk_int8_hnd_gfx12(torch::Tensor query, torch::T
     }
   } else {
     if (head_dim == 16) {
-      hipLaunchKernelGGL((quant_qk_int8_hnd_kernel<__hip_bfloat16, 16>), grid, block, 0, stream,
+      quant_qk_int8_hnd_kernel<__hip_bfloat16, 16><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
                          query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups);
     } else if (head_dim == 64) {
-      hipLaunchKernelGGL((quant_qk_int8_hnd_kernel<__hip_bfloat16, 64>), grid, block, 0, stream,
+      quant_qk_int8_hnd_kernel<__hip_bfloat16, 64><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
                          query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups);
     } else {
-      hipLaunchKernelGGL((quant_qk_int8_hnd_kernel<__hip_bfloat16, 128>), grid, block, 0, stream,
+      quant_qk_int8_hnd_kernel<__hip_bfloat16, 128><<<grid, block, 0, stream>>>(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
@@ -5720,7 +5686,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     constexpr bool use_f16_tvload = false;
 #define SAGEATTN_LAUNCH_RAW_QK_F16_CAUSAL(BR_, TVLOAD_, PAD_, F16ACC_) \
     if (head_dim == 16) { \
-      hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, false, PAD_, true, TVLOAD_, F16ACC_, __half, true, __half, true, false, false, false, false, 16>), grid, block, 0, stream, \
+      qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, false, PAD_, true, TVLOAD_, F16ACC_, __half, true, __half, true, false, false, false, false, 16><<<grid, block, 0, stream>>>( \
           reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), \
           reinterpret_cast<const __half*>(key.data_ptr<at::Half>()), \
           reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
@@ -5734,7 +5700,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
           0, 0, 0, 0, \
           kHND, sm_scale); \
     } else { \
-      hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, false, PAD_, true, TVLOAD_, F16ACC_, __half, true, __half, true>), grid, block, 0, stream, \
+      qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, false, PAD_, true, TVLOAD_, F16ACC_, __half, true, __half, true><<<grid, block, 0, stream>>>( \
         reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), \
         reinterpret_cast<const __half*>(key.data_ptr<at::Half>()), \
         reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
@@ -5849,7 +5815,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
       fused_ks_stride_h = prepared[1].stride(1);
     }
 #define SAGEATTN_LAUNCH_PREPARED_FP8_EX(BC_, HD_, BR_, VT_, CAUSAL_, OUT_T_, LOWP_) \
-    hipLaunchKernelGGL((qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), true, BR_, VT_, CAUSAL_, OUT_T_, int8_t, false, int8_t, uint8_t, false, false, 0, false, false, 2, LOWP_>), grid, block, 0, stream, \
+    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), true, BR_, VT_, CAUSAL_, OUT_T_, int8_t, false, int8_t, uint8_t, false, false, 0, false, false, 2, LOWP_><<<grid, block, 0, stream>>>( \
         prepared[0].data_ptr<int8_t>(), prepared[2].data_ptr<int8_t>(), \
         prepared[4].data_ptr<uint8_t>(), \
         reinterpret_cast<OUT_T_*>(output.data_ptr()), \
@@ -5866,7 +5832,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     SAGEATTN_LAUNCH_PREPARED_FP8_EX(BC_, HD_, BR_, VT_, CAUSAL_, OUT_T_, false)
 
 #define SAGEATTN_LAUNCH_FUSED_Q_FP8_IMPL_SLICE(BC_, HD_, BR_, CAUSAL_, KVLANE_, SC_, KLANE_, VLANE_, VBASE_, VTILES_) \
-    hipLaunchKernelGGL((qk_int8_sv_f8_native_2q_kernel<BC_, HD_, VBASE_, VTILES_, true, BR_, true, CAUSAL_, __half, __half, true, int8_t, uint8_t, false, KVLANE_, SC_, KLANE_, VLANE_>), grid, block, 0, stream, \
+    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, VBASE_, VTILES_, true, BR_, true, CAUSAL_, __half, __half, true, int8_t, uint8_t, false, KVLANE_, SC_, KLANE_, VLANE_><<<grid, block, 0, stream>>>( \
         reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), fused_key_ptr, \
         fused_value_ptr, \
         reinterpret_cast<__half*>(output.data_ptr()), \
@@ -6026,7 +5992,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         prepare_kv_hnd_packed_gfx12<__half, false>(query, key, value);
 #define SAGEATTN_LAUNCH_F16_FUSED_Q_TV_CAUSAL(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_) \
     if (head_dim == 16) { \
-      hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, 16>), grid, block, 0, stream, \
+      qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, 16><<<grid, block, 0, stream>>>( \
           reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
           reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
           reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6041,7 +6007,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
           kHND, sm_scale); \
     } else { \
       if (use_f16_flat_q_schedule) { \
-        hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, 64, true>), grid_f16_flat, block, 0, stream, \
+        qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, 64, true><<<grid_f16_flat, block, 0, stream>>>( \
           reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
           reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
           reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6055,7 +6021,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
           prepared[1].stride(0), prepared[1].stride(1), \
           kHND, sm_scale); \
       } else { \
-        hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_>), grid, block, 0, stream, \
+        qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_><<<grid, block, 0, stream>>>( \
           reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
           reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
           reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6072,7 +6038,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     }
 #define SAGEATTN_LAUNCH_F16_FUSED_Q_TV_NONCAUSAL(BR_, PAD_, F16ACC_, PVORDER_, VLANE_, KLANE_) \
     if (head_dim == 16) { \
-      hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, false, false, F16ACC_, __half, true, int8_t, false, PVORDER_, false, false, false, 16>), grid, block, 0, stream, \
+      qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, false, false, F16ACC_, __half, true, int8_t, false, PVORDER_, false, false, false, 16><<<grid, block, 0, stream>>>( \
           reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
           reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
           reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6086,7 +6052,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         prepared[1].stride(0), prepared[1].stride(1), \
         kHND, sm_scale); \
     } else { \
-      hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, false, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, false, KLANE_>), grid, block, 0, stream, \
+      qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, PAD_, false, false, F16ACC_, __half, true, int8_t, false, PVORDER_, VLANE_, false, KLANE_><<<grid, block, 0, stream>>>( \
         reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
         reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6101,7 +6067,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         kHND, sm_scale); \
     }
 #define SAGEATTN_LAUNCH_F16_FUSED_Q_RAWV_CAUSAL(BC_, BR_, PAD_, F16ACC_, VLANE_, STREAM_) \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, false, PAD_, true, true, F16ACC_, __half, true, int8_t, false, false, VLANE_, STREAM_>), grid, block, 0, stream, \
+    qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, false, PAD_, true, true, F16ACC_, __half, true, int8_t, false, false, VLANE_, STREAM_><<<grid, block, 0, stream>>>( \
         reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
         reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6115,7 +6081,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         prepared[1].stride(0), prepared[1].stride(1), \
         kHND, sm_scale)
 #define SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_RAWV_CAUSAL(BR_, F16ACC_, SPLIT_) \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_kernel<64, BR_, true, false, 4, true, true, F16ACC_, true, __half, true, SPLIT_>), grid, block, 0, stream, \
+    qk_int8_sv_f16_d64_native_kernel<64, BR_, true, false, 4, true, true, F16ACC_, true, __half, true, SPLIT_><<<grid, block, 0, stream>>>( \
         reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
         reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6129,7 +6095,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
         prepared[1].stride(0), prepared[1].stride(1), \
         kHND, sm_scale)
 #define SAGEATTN_LAUNCH_F16_FUSED_Q_1Q_TV_CAUSAL(BR_, F16ACC_) \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_kernel<64, BR_, true, true, 4, true, false, F16ACC_, true, __half, true>), grid, block, 0, stream, \
+    qk_int8_sv_f16_d64_native_kernel<64, BR_, true, true, 4, true, false, F16ACC_, true, __half, true><<<grid, block, 0, stream>>>( \
         reinterpret_cast<const __half*>(query.data_ptr<at::Half>()), prepared[0].data_ptr<int8_t>(), \
         reinterpret_cast<const __half*>(prepared[2].data_ptr<at::Half>()), \
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6383,7 +6349,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       q_len == 4096 && block_rows == 256;
 #define SAGEATTN_LAUNCH_FP8_2Q_OUT(BC_, HD_, HND_, BR_, OUT_T_) \
   if (is_causal) { \
-    hipLaunchKernelGGL((qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, false, true, OUT_T_>), grid, block, 0, stream, \
+    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, false, true, OUT_T_><<<grid, block, 0, stream>>>( \
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
       value.data_ptr<uint8_t>(), \
       reinterpret_cast<OUT_T_*>(output.data_ptr()), \
@@ -6397,7 +6363,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       key_scale.stride(0), key_scale.stride(1), \
       tensor_layout, sm_scale); \
   } else { \
-    hipLaunchKernelGGL((qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, false, false, OUT_T_>), grid, block, 0, stream, \
+    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, false, false, OUT_T_><<<grid, block, 0, stream>>>( \
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
       value.data_ptr<uint8_t>(), \
       reinterpret_cast<OUT_T_*>(output.data_ptr()), \
@@ -6419,7 +6385,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   }
 #define SAGEATTN_LAUNCH_FP8_2Q_TV_OUT(BC_, HD_, BR_, OUT_T_) \
   if (is_causal) { \
-    hipLaunchKernelGGL((qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), true, BR_, true, true, OUT_T_>), grid, block, 0, stream, \
+    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), true, BR_, true, true, OUT_T_><<<grid, block, 0, stream>>>( \
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
       value.data_ptr<uint8_t>(), \
       reinterpret_cast<OUT_T_*>(output.data_ptr()), \
@@ -6433,7 +6399,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       key_scale.stride(0), key_scale.stride(1), \
       tensor_layout, sm_scale); \
   } else { \
-    hipLaunchKernelGGL((qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), true, BR_, true, false, OUT_T_>), grid, block, 0, stream, \
+    qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), true, BR_, true, false, OUT_T_><<<grid, block, 0, stream>>>( \
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
       value.data_ptr<uint8_t>(), \
       reinterpret_cast<OUT_T_*>(output.data_ptr()), \
@@ -6454,7 +6420,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     SAGEATTN_LAUNCH_FP8_2Q_TV_OUT(BC_, HD_, BR_, __half); \
   }
 #define SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, GRID_, FLAT_) \
-  hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, int8_t, false, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, 64, FLAT_>), GRID_, block, 0, stream, \
+  qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, true, false, F16ACC_, int8_t, false, int8_t, false, PVORDER_, VLANE_, STREAM_, KLANE_, 64, FLAT_><<<GRID_, block, 0, stream>>>( \
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
       reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
       reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6474,7 +6440,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, grid, false); \
   }
 #define SAGEATTN_LAUNCH_F16_D16_2Q_TV(BC_, BR_, PAD_, CAUSAL_, F16ACC_) \
-  hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, CAUSAL_, false, F16ACC_, int8_t, false, int8_t, false, false, false, false, false, 16>), grid, block, 0, stream, \
+  qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, CAUSAL_, false, F16ACC_, int8_t, false, int8_t, false, false, false, false, false, 16><<<grid, block, 0, stream>>>( \
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
       reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
       reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6508,7 +6474,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       else { SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, false, false, false, false, false); } \
     } \
   } else { \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_>), grid, block, 0, stream, \
+    qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_><<<grid, block, 0, stream>>>( \
         query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
         reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6524,7 +6490,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   }
 #define SAGEATTN_LAUNCH_F16_2Q(BC_, HND_, BR_) \
   if (is_causal) { \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, HND_, BR_, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD, true>), grid, block, 0, stream, \
+    qk_int8_sv_f16_d64_native_2q_kernel<BC_, HND_, BR_, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD, true><<<grid, block, 0, stream>>>( \
         query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
         reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6538,7 +6504,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         key_scale.stride(0), key_scale.stride(1), \
         tensor_layout, sm_scale); \
   } else { \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, HND_, BR_>), grid, block, 0, stream, \
+    qk_int8_sv_f16_d64_native_2q_kernel<BC_, HND_, BR_><<<grid, block, 0, stream>>>( \
         query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
         reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6553,7 +6519,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         tensor_layout, sm_scale); \
   }
 #define SAGEATTN_LAUNCH_F16_2Q_TVLOAD_CAUSAL(BC_, BR_, PAD_, F16ACC_) \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, false, PAD_, true, true, F16ACC_>), grid, block, 0, stream, \
+    qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, false, PAD_, true, true, F16ACC_><<<grid, block, 0, stream>>>( \
         query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
         reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6570,7 +6536,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   if (is_causal) { \
     SAGEATTN_LAUNCH_F16_2Q_TVLOAD_CAUSAL(BC_, BR_, PAD_, false); \
   } else { \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, false, PAD_, false, true>), grid, block, 0, stream, \
+    qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, false, PAD_, false, true><<<grid, block, 0, stream>>>( \
         query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
         reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6585,7 +6551,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         tensor_layout, sm_scale); \
   }
 #define SAGEATTN_LAUNCH_F16_1Q(BC_, BR_) \
-  hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_kernel<BC_, BR_>), grid, block, 0, stream, \
+  qk_int8_sv_f16_d64_native_kernel<BC_, BR_><<<grid, block, 0, stream>>>( \
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
       reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
       reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6599,7 +6565,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       key_scale.stride(0), key_scale.stride(1), \
       tensor_layout, sm_scale)
 #define SAGEATTN_LAUNCH_F16_1Q_CAUSAL(BR_, TRANSPOSED_, TVLOAD_, PAD_, F16ACC_) \
-  hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_kernel<64, BR_, true, TRANSPOSED_, PAD_, true, TVLOAD_, F16ACC_>), grid, block, 0, stream, \
+  qk_int8_sv_f16_d64_native_kernel<64, BR_, true, TRANSPOSED_, PAD_, true, TVLOAD_, F16ACC_><<<grid, block, 0, stream>>>( \
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
       reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
       reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -6761,7 +6727,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       SAGEATTN_LAUNCH_FP8_2Q(32, 64, false, 128);
     }
   } else if (use_fp8_2q && block_cols == 128 && head_dim == 128) {
-    hipLaunchKernelGGL((qk_int8_sv_f8_native_2q_kernel<128, 128, 0, 8>), grid, block, 0, stream,
+    qk_int8_sv_f8_native_2q_kernel<128, 128, 0, 8><<<grid, block, 0, stream>>>(
         query.data_ptr<int8_t>(), key.data_ptr<int8_t>(),
         value.data_ptr<uint8_t>(),
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
@@ -6775,7 +6741,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         key_scale.stride(0), key_scale.stride(1),
         tensor_layout, sm_scale);
   } else if (use_fp8_2q && block_cols == 128) {
-    hipLaunchKernelGGL((qk_int8_sv_f8_native_2q_kernel<128, 64, 0, 4>), grid, block, 0, stream,
+    qk_int8_sv_f8_native_2q_kernel<128, 64, 0, 4><<<grid, block, 0, stream>>>(
         query.data_ptr<int8_t>(), key.data_ptr<int8_t>(),
         value.data_ptr<uint8_t>(),
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()),
