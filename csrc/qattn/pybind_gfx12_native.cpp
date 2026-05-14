@@ -16,7 +16,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("transpose_value_fp8_hnd", &transpose_value_fp8_hnd_gfx12);
   m.def("transpose_value_f16_hnd", &transpose_value_f16_hnd_gfx12);
   m.def("convert_f16_to_bf16", &convert_f16_to_bf16_gfx12);
-  m.def("quant_qk_int8_hnd", &quant_qk_int8_hnd_gfx12);
-  m.def("prepare_qkv_f16_hnd", &prepare_qkv_f16_hnd_gfx12);
-  m.def("prepare_qkv_fp8_hnd", &prepare_qkv_fp8_hnd_gfx12);
 }

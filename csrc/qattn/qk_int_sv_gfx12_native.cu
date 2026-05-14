@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2024 by SageAttention team.
+ * Copyright (c) 2026 Advanced Micro Devices, Inc.
  *
  * Licensed under the Apache License, Version 2.0.
  */
@@ -124,16 +125,6 @@ __device__ __forceinline__ int8_t float_to_int8_rn_gfx12(const float x) {
   return static_cast<int8_t>(rounded);
 }
 
-__device__ __forceinline__ int8_t float_to_int4_rn_gfx12(const float x) {
-  int32_t rounded;
-  asm volatile("v_cvt_i32_f32 %[dst], %[src]"
-               : [dst] "=v"(rounded)
-               : [src] "v"(x));
-  rounded = rounded > 7 ? 7 : rounded;
-  rounded = rounded < -8 ? -8 : rounded;
-  return static_cast<int8_t>(rounded);
-}
-
 template <typename T, int HeadDim>
 __global__ void quant_qk_int8_hnd_kernel(
     const T* __restrict__ query,
@@ -221,98 +212,6 @@ __global__ void quant_qk_int8_hnd_kernel(
       out1.w = float_to_int8_rn_gfx12(value_to_float(values[7]) * inv_scale);
       *reinterpret_cast<char4*>(out + off) = out0;
       *reinterpret_cast<char4*>(out + off + 4) = out1;
-    }
-  }
-}
-
-template <typename T, int HeadDim>
-__global__ void quant_qk_int4_hnd_kernel(
-    const T* __restrict__ query,
-    const T* __restrict__ key,
-    uint8_t* __restrict__ query_out,
-    uint8_t* __restrict__ key_out,
-    float* __restrict__ query_scale,
-    float* __restrict__ key_scale,
-    const int64_t batch,
-    const int64_t q_heads,
-    const int64_t kv_heads,
-    const int64_t q_len,
-    const int64_t kv_len,
-    const int q_groups,
-    const int k_groups) {
-  constexpr int Threads = 256;
-  constexpr int PackElems = 8;
-  static_assert((HeadDim % PackElems) == 0, "native int4 quantization packs eight elements");
-  constexpr int PackedHeadDim = HeadDim / 2;
-  __shared__ float shared_amax;
-
-  const int group = blockIdx.x;
-  const int head = blockIdx.y;
-  const int b = blockIdx.z;
-  const int tid = threadIdx.x;
-  const bool is_q = group < q_groups;
-  const int local_group = is_q ? group : group - q_groups;
-  const int rows_per_group = is_q ? 32 : 64;
-  const int64_t seq_len = is_q ? q_len : kv_len;
-  const int64_t base_row = static_cast<int64_t>(local_group) * rows_per_group;
-  const int active_heads = is_q ? static_cast<int>(q_heads) : static_cast<int>(kv_heads);
-  if (b >= batch || head >= active_heads || base_row >= seq_len) {
-    return;
-  }
-
-  const T* in = is_q ? query : key;
-  uint8_t* out = is_q ? query_out : key_out;
-  float* scale_out = is_q ? query_scale : key_scale;
-  const int64_t heads = is_q ? q_heads : kv_heads;
-  const int scale_groups = is_q ? q_groups : k_groups;
-  const int packs = (rows_per_group * HeadDim) / PackElems;
-
-  float local_amax = 0.0000001f;
-  for (int pack = tid; pack < packs; pack += Threads) {
-    const int elem_base = pack * PackElems;
-    const int row = elem_base / HeadDim;
-    const int d = elem_base - row * HeadDim;
-    const int64_t seq = base_row + row;
-    if (seq < seq_len) {
-      const int64_t off =
-          ((static_cast<int64_t>(b) * heads + head) * seq_len + seq) * HeadDim + d;
-      const uint4 raw = *reinterpret_cast<const uint4*>(in + off);
-      const T* values = reinterpret_cast<const T*>(&raw);
-#pragma unroll
-      for (int i = 0; i < PackElems; ++i) {
-        local_amax = fmaxf(local_amax, fabsf(value_to_float(values[i])));
-      }
-    }
-  }
-  const float block_amax = vllm::blockReduceMax(local_amax);
-  if (tid == 0) {
-    shared_amax = block_amax;
-    scale_out[(static_cast<int64_t>(b) * active_heads + head) * scale_groups + local_group] =
-        shared_amax / 7.0f;
-  }
-  __syncthreads();
-  const float inv_scale = 7.0f / shared_amax;
-
-  for (int pack = tid; pack < packs; pack += Threads) {
-    const int elem_base = pack * PackElems;
-    const int row = elem_base / HeadDim;
-    const int d = elem_base - row * HeadDim;
-    const int64_t seq = base_row + row;
-    if (seq < seq_len) {
-      const int64_t off =
-          ((static_cast<int64_t>(b) * heads + head) * seq_len + seq) * HeadDim + d;
-      const uint4 raw = *reinterpret_cast<const uint4*>(in + off);
-      const T* values = reinterpret_cast<const T*>(&raw);
-      uint32_t packed = 0;
-#pragma unroll
-      for (int i = 0; i < PackElems; ++i) {
-        const int8_t qv = float_to_int4_rn_gfx12(value_to_float(values[i]) * inv_scale);
-        packed |= (static_cast<uint32_t>(qv) & 0xfu) << (4 * i);
-      }
-      const int64_t out_off =
-          ((static_cast<int64_t>(b) * heads + head) * seq_len + seq) * PackedHeadDim +
-          (d >> 1);
-      *reinterpret_cast<uint32_t*>(out + out_off) = packed;
     }
   }
 }
@@ -7962,20 +7861,6 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
   return {key_out, key_scale, value_out, byte_workspace, scale_workspace};
 }
 
-std::vector<torch::Tensor> prepare_qkv_fp8_hnd_gfx12(
-    torch::Tensor query,
-    torch::Tensor key,
-    torch::Tensor value) {
-  return prepare_qkv_hnd_gfx12<uint8_t, true>(query, key, value);
-}
-
-std::vector<torch::Tensor> prepare_qkv_f16_hnd_gfx12(
-    torch::Tensor query,
-    torch::Tensor key,
-    torch::Tensor value) {
-  return prepare_qkv_hnd_gfx12<__half, false>(query, key, value);
-}
-
 template <typename T, int HeadDim, int Threads = 256>
 __global__ void prepare_k_hnd_kernel(
     const T* __restrict__ key,
@@ -8247,51 +8132,6 @@ std::vector<torch::Tensor> quant_qk_int8_hnd_gfx12(torch::Tensor query, torch::T
   return {query_out, query_scale, key_out, key_scale};
 }
 
-std::vector<torch::Tensor> quant_qk_int4_hnd_gfx12(torch::Tensor query, torch::Tensor key) {
-  TORCH_CHECK(query.is_cuda() && key.is_cuda(), "gfx12 Q/K int4 quantization expects CUDA/HIP tensors");
-  TORCH_CHECK(query.dim() == 4 && key.dim() == 4, "gfx12 Q/K int4 quantization expects [B, H, S, D]");
-  TORCH_CHECK(query.is_contiguous() && key.is_contiguous(),
-              "gfx12 Q/K int4 quantization expects contiguous HND tensors");
-  TORCH_CHECK(query.scalar_type() == key.scalar_type(),
-              "gfx12 Q/K int4 quantization expects matching Q/K dtypes");
-  TORCH_CHECK(query.scalar_type() == torch::kFloat16,
-              "gfx12 Q/K int4 quantization supports fp16 input");
-  TORCH_CHECK(query.size(0) == key.size(0), "Q/K batch size mismatch");
-  TORCH_CHECK(query.size(3) == key.size(3), "Q/K head_dim mismatch");
-  const int64_t batch = query.size(0);
-  const int64_t q_heads = query.size(1);
-  const int64_t q_len = query.size(2);
-  const int64_t kv_heads = key.size(1);
-  const int64_t kv_len = key.size(2);
-  const int64_t head_dim = query.size(3);
-  TORCH_CHECK(head_dim == 64, "gfx12 native Q/K int4 quantization supports head_dim 64");
-  TORCH_CHECK((q_len % 64) == 0 && (kv_len % 64) == 0,
-              "gfx12 native Q/K int4 quantization requires sequence lengths divisible by 64");
-
-  const int q_groups = static_cast<int>((q_len + 31) / 32);
-  const int k_groups = static_cast<int>((kv_len + 63) / 64);
-  torch::Tensor query_out =
-      torch::empty({batch, q_heads, q_len, head_dim / 2}, query.options().dtype(torch::kUInt8));
-  torch::Tensor key_out =
-      torch::empty({batch, kv_heads, kv_len, head_dim / 2}, key.options().dtype(torch::kUInt8));
-  torch::Tensor query_scale =
-      torch::empty({batch, q_heads, q_groups}, query.options().dtype(torch::kFloat32));
-  torch::Tensor key_scale =
-      torch::empty({batch, kv_heads, k_groups}, key.options().dtype(torch::kFloat32));
-
-  const dim3 block(256);
-  const dim3 grid(q_groups + k_groups, std::max(q_heads, kv_heads), batch);
-  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-  hipLaunchKernelGGL((quant_qk_int4_hnd_kernel<__half, 64>), grid, block, 0, stream,
-                     reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
-                     reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
-                     query_out.data_ptr<uint8_t>(), key_out.data_ptr<uint8_t>(),
-                     query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
-                     batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups);
-  hip_kernel_launch_check();
-  return {query_out, query_scale, key_out, key_scale};
-}
-
 static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     torch::Tensor query,
     torch::Tensor key,
@@ -8364,104 +8204,6 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
       q_len <= 8192 &&
       !prefer_prepared_f16_causal &&
       !std::getenv("SAGEATTN_GFX12_NATIVE_NO_F16_FUSED_Q");
-  if (std::getenv("SAGEATTN_GFX12_NATIVE_F16_I4_QK")) {
-    TORCH_CHECK(!value_is_fp8, "gfx12 fp16 int4 QK path requires fp16 values");
-    TORCH_CHECK(is_causal, "gfx12 fp16 int4 QK path is causal-only");
-    TORCH_CHECK(head_dim == 64, "gfx12 fp16 int4 QK path requires head_dim 64");
-    TORCH_CHECK(query.scalar_type() == torch::kFloat16,
-                "gfx12 fp16 int4 QK path requires fp16 Q/K/V");
-    TORCH_CHECK(q_len == kv_len, "gfx12 fp16 int4 QK path requires q_len == kv_len");
-    const bool use_i4_vlane =
-        std::getenv("SAGEATTN_GFX12_NATIVE_F16_I4_VLANE") != nullptr;
-    const bool use_i4_stream =
-        std::getenv("SAGEATTN_GFX12_NATIVE_F16_I4_STREAMK") != nullptr;
-    int block_rows = q_len <= 64 ? 64 : 128;
-    if (const char* opt = std::getenv("SAGEATTN_GFX12_NATIVE_BR")) {
-      if (std::strcmp(opt, "64") == 0) {
-        block_rows = 64;
-      } else if (std::strcmp(opt, "256") == 0 && (q_len % 256) == 0) {
-        block_rows = 256;
-      }
-    }
-    TORCH_CHECK((q_len % block_rows) == 0,
-                "gfx12 fp16 int4 QK path requires q_len to be a multiple of block rows");
-    const bool time_gfx12_native = std::getenv("SAGEATTN_GFX12_NATIVE_TIMING");
-    hipEvent_t timing_start = nullptr;
-    hipEvent_t timing_prepared = nullptr;
-    hipEvent_t timing_done = nullptr;
-    if (time_gfx12_native) {
-      TORCH_CHECK(hipEventCreate(&timing_start) == hipSuccess, "failed to create HIP timing event");
-      TORCH_CHECK(hipEventCreate(&timing_prepared) == hipSuccess, "failed to create HIP timing event");
-      TORCH_CHECK(hipEventCreate(&timing_done) == hipSuccess, "failed to create HIP timing event");
-      TORCH_CHECK(hipEventRecord(timing_start, at::cuda::getCurrentCUDAStream()) == hipSuccess,
-                  "failed to record HIP timing event");
-    }
-    std::vector<torch::Tensor> prepared = quant_qk_int4_hnd_gfx12(query, key);
-    if (time_gfx12_native) {
-      TORCH_CHECK(hipEventRecord(timing_prepared, at::cuda::getCurrentCUDAStream()) == hipSuccess,
-                  "failed to record HIP timing event");
-    }
-    const dim3 block(block_rows);
-    const dim3 grid((q_len + block_rows - 1) / block_rows, q_heads, batch);
-    const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-#define SAGEATTN_LAUNCH_F16_I4_QK_CAUSAL(BR_, VLANE_, STREAM_) \
-    hipLaunchKernelGGL((qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, false, 4, true, true, true, uint8_t, false, uint8_t, false, true, false, VLANE_, STREAM_, false, false, false, true>), grid, block, 0, stream, \
-        prepared[0].data_ptr<uint8_t>(), prepared[2].data_ptr<uint8_t>(), \
-        reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
-        reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
-        prepared[1].data_ptr<float>(), prepared[3].data_ptr<float>(), \
-        batch, q_len, kv_len, q_heads, kv_heads, \
-        prepared[0].stride(0), prepared[0].stride(2), prepared[0].stride(1), \
-        prepared[2].stride(0), prepared[2].stride(2), prepared[2].stride(1), \
-        value.stride(0), value.stride(2), value.stride(1), \
-        output.stride(0), output.stride(2), output.stride(1), \
-        prepared[1].stride(0), prepared[1].stride(1), \
-        prepared[3].stride(0), prepared[3].stride(1), \
-        kHND, sm_scale)
-#define SAGEATTN_DISPATCH_F16_I4_QK_CAUSAL(BR_) \
-    if (use_i4_vlane && use_i4_stream) { SAGEATTN_LAUNCH_F16_I4_QK_CAUSAL(BR_, true, true); } \
-    else if (use_i4_vlane) { SAGEATTN_LAUNCH_F16_I4_QK_CAUSAL(BR_, true, false); } \
-    else if (use_i4_stream) { SAGEATTN_LAUNCH_F16_I4_QK_CAUSAL(BR_, false, true); } \
-    else { SAGEATTN_LAUNCH_F16_I4_QK_CAUSAL(BR_, false, false); }
-    if (block_rows == 64) {
-      SAGEATTN_DISPATCH_F16_I4_QK_CAUSAL(64);
-    } else if (block_rows == 256) {
-      SAGEATTN_DISPATCH_F16_I4_QK_CAUSAL(256);
-    } else {
-      SAGEATTN_DISPATCH_F16_I4_QK_CAUSAL(128);
-    }
-#undef SAGEATTN_DISPATCH_F16_I4_QK_CAUSAL
-#undef SAGEATTN_LAUNCH_F16_I4_QK_CAUSAL
-    hip_kernel_launch_check();
-    if (time_gfx12_native) {
-      TORCH_CHECK(hipEventRecord(timing_done, stream) == hipSuccess,
-                  "failed to record HIP timing event");
-      TORCH_CHECK(hipEventSynchronize(timing_done) == hipSuccess,
-                  "failed to synchronize HIP timing event");
-      float prepare_ms = 0.0f;
-      float attention_ms = 0.0f;
-      TORCH_CHECK(hipEventElapsedTime(&prepare_ms, timing_start, timing_prepared) == hipSuccess,
-                  "failed to compute HIP timing event elapsed time");
-      TORCH_CHECK(hipEventElapsedTime(&attention_ms, timing_prepared, timing_done) == hipSuccess,
-                  "failed to compute HIP timing event elapsed time");
-      std::fprintf(stderr,
-                   "sage_gfx12_f16_i4_qk_timing B=%lld H=%lld S=%lld D=%lld BR=%d vlane=%d stream=%d prepare_ms=%.6f attention_ms=%.6f total_ms=%.6f\n",
-                   static_cast<long long>(batch),
-                   static_cast<long long>(q_heads),
-                   static_cast<long long>(q_len),
-                   static_cast<long long>(head_dim),
-                   block_rows,
-                   use_i4_vlane,
-                   use_i4_stream,
-                   prepare_ms,
-                   attention_ms,
-                   prepare_ms + attention_ms);
-      hipEventDestroy(timing_done);
-      hipEventDestroy(timing_prepared);
-      hipEventDestroy(timing_start);
-    }
-    return output;
-  }
   const bool auto_f16_raw_qk =
       !value_is_fp8 && is_causal && head_dim == 16 &&
       query.scalar_type() == torch::kFloat16 && q_len <= 2048 &&

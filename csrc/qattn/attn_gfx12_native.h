@@ -7,7 +7,6 @@
 #pragma once
 
 #include <torch/extension.h>
-#include <vector>
 
 torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
     torch::Tensor query,
@@ -34,15 +33,3 @@ torch::Tensor transpose_value_fp8_hnd_gfx12(torch::Tensor value);
 torch::Tensor transpose_value_f16_hnd_gfx12(torch::Tensor value);
 
 torch::Tensor convert_f16_to_bf16_gfx12(torch::Tensor input);
-
-std::vector<torch::Tensor> quant_qk_int8_hnd_gfx12(torch::Tensor query, torch::Tensor key);
-
-std::vector<torch::Tensor> prepare_qkv_f16_hnd_gfx12(
-    torch::Tensor query,
-    torch::Tensor key,
-    torch::Tensor value);
-
-std::vector<torch::Tensor> prepare_qkv_fp8_hnd_gfx12(
-    torch::Tensor query,
-    torch::Tensor key,
-    torch::Tensor value);
