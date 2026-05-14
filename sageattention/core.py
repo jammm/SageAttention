@@ -115,10 +115,13 @@ def _pad_gfx12_hnd_sequence(
     v_hnd: torch.Tensor,
     q_len: int,
     kv_len: int,
+    is_causal: bool = False,
     k_pad_value: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    q_pad_len = _round_up_to_multiple(q_len, 64) - q_len
-    kv_pad_len = _round_up_to_multiple(kv_len, 64) - kv_len
+    q_padded_len = _round_up_to_multiple(q_len, 128)
+    kv_padded_len = q_padded_len if is_causal else _round_up_to_multiple(kv_len, 64)
+    q_pad_len = q_padded_len - q_len
+    kv_pad_len = kv_padded_len - kv_len
     if q_pad_len > 0:
         q_hnd = F.pad(q_hnd, (0, 0, 0, q_pad_len))
     if kv_pad_len > 0:
@@ -138,7 +141,7 @@ def sageattn_qk_int8_pv_gfx12_native(
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
     value_dtype: str = "fp8",
-    smooth_k: bool = False,
+    smooth_k: bool = True,
     return_lse: bool = False,
     **kwargs: Any,
 ) -> torch.Tensor:
@@ -153,7 +156,9 @@ def sageattn_qk_int8_pv_gfx12_native(
     - value_dtype="fp8" supports head_dim 16, 64, or 128.
     - value_dtype="fp16" supports head_dim 16 or 64.
     - Causal masking requires q_len == kv_len.
-    - smooth_k is supported for output-only calls.
+    - smooth_k is enabled by default to match the CUDA and Triton paths.
+      head_dim=16 keeps the existing non-smooth path because the fused
+      smoothing quantizer supports head_dim 64/128.
     - return_lse is not implemented yet.
     """
 
@@ -307,9 +312,12 @@ def sageattn_qk_int8_pv_gfx12_native(
     if value_dtype == "fp8" and head_dim not in (16, 64, 128):
         raise ValueError("gfx12 fp8 value path currently supports head_dim 16, 64, or 128.")
 
+    if head_dim == 16:
+        smooth_k = False
+
     k_mean = k_hnd.mean(dim=2, keepdim=True) if smooth_k else None
     q_hnd, k_hnd, v_hnd = _pad_gfx12_hnd_sequence(
-        q_hnd, k_hnd, v_hnd, qo_len, kv_len, k_mean)
+        q_hnd, k_hnd, v_hnd, qo_len, kv_len, bool(is_causal), k_mean)
     padded_qo_len = q_hnd.size(2)
 
     use_raw_f16_value = (
