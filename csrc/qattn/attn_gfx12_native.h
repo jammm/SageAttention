@@ -20,7 +20,8 @@ torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
     int tensor_layout,
     int is_causal,
     float sm_scale,
-    int64_t valid_kv_len = 0);
+    int64_t valid_kv_len = 0,
+    int value_transposed_hnd = -1);
 
 torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
     torch::Tensor query,
@@ -31,7 +32,8 @@ torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
     int tensor_layout,
     int is_causal,
     float sm_scale,
-    int64_t valid_kv_len = 0);
+    int64_t valid_kv_len = 0,
+    int value_transposed_hnd = -1);
 
 torch::Tensor qk_int8_sv_f8_scaled_native_attn_gfx12(
     torch::Tensor query,
@@ -56,7 +58,8 @@ torch::Tensor qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
     int tensor_layout,
     int is_causal,
     float sm_scale,
-    int64_t valid_kv_len = 0);
+    int64_t valid_kv_len = 0,
+    int value_transposed_hnd = -1);
 
 torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     torch::Tensor query,
