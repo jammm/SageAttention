@@ -251,8 +251,6 @@ def sageattn_qk_int8_pv_gfx12_native(
         raise ValueError("qk_quant_gran must be either 'per_warp' or 'per_thread'.")
     if qk_quant_gran != "per_warp":
         raise NotImplementedError("gfx12 native currently supports qk_quant_gran='per_warp'.")
-    if smooth_v:
-        raise NotImplementedError("gfx12 native does not support smooth_v yet.")
     value_dtype_normalized = value_dtype.lower()
     if value_dtype_normalized == "auto":
         value_dtype_normalized = "fp8"
@@ -260,6 +258,12 @@ def sageattn_qk_int8_pv_gfx12_native(
         pv_accum_dtype = "fp32+fp16" if value_dtype_normalized == "fp8" else "fp32"
     if value_dtype_normalized == "fp8" and pv_accum_dtype not in {"fp32+fp16", "fp32", "fp32+fp32"}:
         raise ValueError("gfx12 fp8 value path supports pv_accum_dtype 'fp32+fp16', 'fp32', or 'fp32+fp32'.")
+    if smooth_v and (
+        (value_dtype_normalized == "fp8" and pv_accum_dtype in {"fp32+fp16", "fp32+fp32"})
+        or (value_dtype_normalized == "fp16" and pv_accum_dtype in {"fp32", "fp16+fp32"})
+    ):
+        warnings.warn(f"pv_accum_dtype is {pv_accum_dtype}, smooth_v will be ignored.")
+        smooth_v = False
     if value_dtype_normalized == "fp8" and pv_accum_dtype != "fp32+fp16":
         raise NotImplementedError("gfx12 fp8 value path currently supports pv_accum_dtype='fp32+fp16'.")
     if value_dtype_normalized == "fp16" and pv_accum_dtype not in {"fp32", "fp16", "fp16+fp32"}:
