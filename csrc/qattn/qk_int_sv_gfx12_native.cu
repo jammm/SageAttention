@@ -5698,7 +5698,7 @@ static int select_fp8_d64_block_rows_gfx12(
     const bool is_causal,
     const bool value_transposed_hnd) {
   if (is_causal) {
-    if (q_len <= 2048) {
+    if (q_len <= 64) {
       return 64;
     }
     return 128;

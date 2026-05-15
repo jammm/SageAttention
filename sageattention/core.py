@@ -457,8 +457,13 @@ def sageattn_qk_int8_pv_gfx12_native(
     else:
         use_rawq_hnd_fp8 = (
             value_dtype == "fp8"
-            and not is_causal
             and head_dim in (64, 128)
+            and (
+                not is_causal
+                or head_dim == 64
+                or padded_qo_len <= 1024
+                or padded_qo_len >= 8192
+            )
         )
         if use_rawq_hnd_fp8:
             k_int8 = torch.empty_like(k_hnd, dtype=torch.int8)
