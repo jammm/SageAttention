@@ -492,6 +492,105 @@ __device__ __forceinline__ int k_scale_col_per_warp(const int64_t k_idx) {
   return static_cast<int>(k_idx / 64);
 }
 
+__device__ __forceinline__ int wmma_f16_k_for_lane_elem(
+    const int lane,
+    const int elem);
+
+__device__ __forceinline__ int ceil_div_i64_to_int(
+    const int64_t value,
+    const int64_t divisor) {
+  return static_cast<int>((value + divisor - 1) / divisor);
+}
+
+__device__ __forceinline__ int q_scale_col_per_thread(
+    const int64_t q_idx,
+    const int64_t qo_len,
+    const int64_t q_scale_groups) {
+  const int q_blocks = ceil_div_i64_to_int(qo_len, 128);
+  const int groups_per_128 = q_blocks > 0 ?
+      static_cast<int>(q_scale_groups / q_blocks) : 32;
+  const int warp_q = groups_per_128 >= 64 ? 16 : 32;
+  return static_cast<int>((q_idx / warp_q) * 8 + (q_idx & 7));
+}
+
+__device__ __forceinline__ int k_scale_col_per_thread(
+    const int64_t k_idx,
+    const int64_t kv_len,
+    const int64_t k_scale_groups) {
+  const int k_blocks64 = ceil_div_i64_to_int(kv_len, 64);
+  const int groups_per_64 = k_blocks64 > 0 ?
+      static_cast<int>(k_scale_groups / k_blocks64) : 4;
+  const int warp_k = groups_per_64 <= 2 ? 128 : 64;
+  return static_cast<int>((k_idx / warp_k) * 4 + ((k_idx & 7) >> 1));
+}
+
+template <bool PerThreadQK = false, bool PvOrdered = false>
+__device__ __forceinline__ float qk_score_scale_scalar(
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    const int64_t b,
+    const int64_t hq,
+    const int64_t hkv,
+    const int64_t q_start,
+    const int64_t kb_base,
+    const int col_tile,
+    const int64_t qo_len,
+    const int64_t kv_len,
+    const int64_t qs_stride_b,
+    const int64_t qs_stride_h,
+    const int64_t ks_stride_b,
+    const int64_t ks_stride_h,
+    const float sm_scale) {
+  if constexpr (PerThreadQK) {
+    return 1.0f;
+  } else {
+    const int q_scale_idx = q_scale_col_per_warp(q_start);
+    const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * 16);
+    return q_scale[b * qs_stride_b + hq * qs_stride_h + q_scale_idx] *
+        k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx] *
+        sm_scale * kLog2e;
+  }
+}
+
+template <bool PerThreadQK = false, bool PvOrdered = false>
+__device__ __forceinline__ void apply_per_thread_qk_score_scale(
+    float8_vec& scores,
+    const float* __restrict__ q_scale,
+    const float* __restrict__ k_scale,
+    const int64_t b,
+    const int64_t hq,
+    const int64_t hkv,
+    const int64_t q_start,
+    const int64_t kb_base,
+    const int col_tile,
+    const int lane,
+    const int64_t qo_len,
+    const int64_t kv_len,
+    const int64_t qs_stride_b,
+    const int64_t qs_stride_h,
+    const int64_t ks_stride_b,
+    const int64_t ks_stride_h,
+    const float sm_scale) {
+  if constexpr (PerThreadQK) {
+    const int64_t q_idx = q_start + (lane & 15);
+    const int q_scale_idx = q_scale_col_per_thread(q_idx, qo_len, qs_stride_h);
+    const float q_scale_local =
+        q_scale[b * qs_stride_b + hq * qs_stride_h + q_scale_idx] *
+        sm_scale * kLog2e;
+#pragma unroll
+    for (int elem = 0; elem < 8; ++elem) {
+      const int k_local = PvOrdered ?
+          wmma_f16_k_for_lane_elem(lane, elem) :
+          (((lane >> 4) << 3) + elem);
+      const int64_t k_idx = kb_base + col_tile * 16 + k_local;
+      const int k_scale_idx = k_scale_col_per_thread(k_idx, kv_len, ks_stride_h);
+      scores[elem] *=
+          q_scale_local *
+          k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+    }
+  }
+}
+
 template <bool IsCausal, int BlockRows>
 __device__ __forceinline__ int64_t q_block_base_for_launch(
     const int64_t block_x,
@@ -1292,7 +1391,8 @@ template <
     bool PvOrderedQK = false,
     typename QueryT = int8_t,
     bool QuantizeQuery = false,
-    bool SplitCausalPrefix = false>
+    bool SplitCausalPrefix = false,
+    bool PerThreadQK = false>
 SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32, 1) void qk_int8_sv_f16_d64_native_kernel(
     const QueryT* __restrict__ q,
     const int8_t* __restrict__ k,
@@ -1322,7 +1422,8 @@ SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32,
     const int64_t ks_stride_b,
     const int64_t ks_stride_h,
     const int tensor_layout,
-    const float sm_scale) {
+    const float sm_scale,
+    const bool per_thread_qk = false) {
   constexpr int HeadDim = 64;
   constexpr int BR = BlockRows;
   constexpr int RM = 16;
@@ -1409,9 +1510,13 @@ SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32,
           q_stride_b, q_stride_n, q_stride_h, inv_q_scale);
     }
   } else {
-    const int q_scale_idx = q_scale_col_per_warp(q_start);
-    qs = q_scale[b * qs_stride_b + hq * qs_stride_h + q_scale_idx] *
-        sm_scale * kLog2e;
+    if constexpr (PerThreadQK) {
+      qs = 1.0f;
+    } else {
+      const int q_scale_idx = q_scale_col_per_warp(q_start);
+      qs = q_scale[b * qs_stride_b + hq * qs_stride_h + q_scale_idx] *
+          sm_scale * kLog2e;
+    }
     if constexpr (UseRawPreparedQ) {
 #pragma unroll
       for (int dt = 0; dt < DTiles; ++dt) {
@@ -1510,9 +1615,9 @@ SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32,
       float local_max = -FLT_MAX * 0.5f;
 #pragma unroll
       for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
-        const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * BK);
-        const float score_scale = qs *
-            k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+        const float score_scale = qk_score_scale_scalar<PerThreadQK, PvOrderedQK>(q_scale, k_scale, b, hq, hkv, q_start, kb_base, col_tile,
+            qo_len, kv_len, qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h,
+            sm_scale);
         float8_vec scores;
         const int64_t k_col_start = kb_base + static_cast<int64_t>(col_tile) * BK;
         const bool fully_future =
@@ -1537,6 +1642,9 @@ SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32,
           scores = compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
               &k_tile[0][0], q_frag, col_tile, score_scale);
         }
+        apply_per_thread_qk_score_scale<PerThreadQK, PvOrderedQK>(scores, q_scale, k_scale, b, hq, hkv, q_start, kb_base, col_tile, lane,
+            qo_len, kv_len, qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h,
+            sm_scale);
         if constexpr (ApplyCausalMask) {
           if (!fully_future && k_col_start + BK > q_start) {
             if constexpr (PvOrderedQK) {
@@ -1642,9 +1750,9 @@ SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32,
       float local_max = -FLT_MAX * 0.5f;
 #pragma unroll
       for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
-        const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * BK);
-        const float score_scale = qs *
-            k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+        const float score_scale = qk_score_scale_scalar<PerThreadQK, false>(q_scale, k_scale, b, hq, hkv, q_start, kb_base, col_tile,
+            qo_len, kv_len, qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h,
+            sm_scale);
         const int64_t k_col_start = kb_base + static_cast<int64_t>(col_tile) * BK;
         float8_vec scores;
         if constexpr (QuantizeQuery || UseRawPreparedQ) {
@@ -1654,6 +1762,9 @@ SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32,
           scores = compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
               &k_tile[0][0], q_frag, col_tile, score_scale);
         }
+        apply_per_thread_qk_score_scale<PerThreadQK, false>(scores, q_scale, k_scale, b, hq, hkv, q_start, kb_base, col_tile, lane,
+            qo_len, kv_len, qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h,
+            sm_scale);
         if (k_col_start + BK > kv_len) {
           apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
         }
@@ -1680,9 +1791,9 @@ SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32,
       float local_sum = 0.0f;
 #pragma unroll
       for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
-        const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * BK);
-        const float score_scale = qs *
-            k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+        const float score_scale = qk_score_scale_scalar<PerThreadQK, false>(q_scale, k_scale, b, hq, hkv, q_start, kb_base, col_tile,
+            qo_len, kv_len, qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h,
+            sm_scale);
         const int64_t k_col_start = kb_base + static_cast<int64_t>(col_tile) * BK;
         float8_vec scores;
           if constexpr (QuantizeQuery || UseRawPreparedQ) {
@@ -1692,6 +1803,9 @@ SAGEATTN_NATIVE_WAVES_PER_EU __global__ __launch_bounds__((BlockRows / 16) * 32,
           scores = compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
               &k_tile[0][0], q_frag, col_tile, score_scale);
         }
+        apply_per_thread_qk_score_scale<PerThreadQK, false>(scores, q_scale, k_scale, b, hq, hkv, q_start, kb_base, col_tile, lane,
+            qo_len, kv_len, qs_stride_b, qs_stride_h, ks_stride_b, ks_stride_h,
+            sm_scale);
         if (k_col_start + BK > kv_len) {
           apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
         }
@@ -1797,7 +1911,8 @@ template <int BlockCols,
           bool StreamColTiles = false,
           bool LaneMajorKey = false,
           int HeadDim = 64,
-          bool FlatCausalSchedule = false>
+          bool FlatCausalSchedule = false,
+          bool PerThreadQK = false>
 SAGEATTN_NATIVE_2Q_WAVES_PER_EU(HeadDim, IsCausal) __global__
 SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2q_kernel(
     const QueryT* __restrict__ q,
@@ -1828,7 +1943,8 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
     const int64_t ks_stride_b,
     const int64_t ks_stride_h,
     const int tensor_layout,
-    const float sm_scale) {
+    const float sm_scale,
+    const bool per_thread_qk = false) {
   static_assert(HeadDim == 16 || HeadDim == 64 || HeadDim == 128,
                 "native gfx12 fp16 2q kernel supports D16/D64/D128.");
   constexpr int BR = BlockRows;
@@ -1964,9 +2080,13 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
   } else {
 #pragma unroll
     for (int qg = 0; qg < QGroups; ++qg) {
-      const int q_scale_idx = q_scale_col_per_warp(q_start[qg]);
-      qs[qg] = q_scale[b * qs_stride_b + hq * qs_stride_h + q_scale_idx] *
-          sm_scale * kLog2e;
+      if constexpr (PerThreadQK) {
+        qs[qg] = 1.0f;
+      } else {
+        const int q_scale_idx = q_scale_col_per_warp(q_start[qg]);
+        qs[qg] = q_scale[b * qs_stride_b + hq * qs_stride_h + q_scale_idx] *
+            sm_scale * kLog2e;
+      }
     }
     if constexpr (UseRawPreparedQ) {
 #pragma unroll
@@ -2099,9 +2219,11 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
 
     float prepared_k_scale_tile = k_scale_tile;
     if constexpr (!QuantizeKey && BC <= 64) {
-      const int k_scale_idx = k_scale_col_per_warp(kb_base);
-      prepared_k_scale_tile =
-          k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+      if constexpr (!PerThreadQK) {
+        const int k_scale_idx = k_scale_col_per_warp(kb_base);
+        prepared_k_scale_tile =
+            k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+      }
     }
 
     auto stage_value_tile = [&]() {
@@ -2228,9 +2350,11 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
 
             float k_scale_local = prepared_k_scale_tile;
             if constexpr (!QuantizeKey && BC > 64) {
-              const int k_scale_idx = k_scale_col_per_warp(k_col_start);
-              k_scale_local =
-                  k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+              if constexpr (!PerThreadQK) {
+                const int k_scale_idx = k_scale_col_per_warp(k_col_start);
+                k_scale_local =
+                    k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+              }
             }
             if constexpr (UseLaneMajorKey) {
               compute_tqk_score_regs_raw_kq_2_lane_shared_key<DTiles>(
@@ -2245,6 +2369,12 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                   !fully_future0, !fully_future1,
                   scores0[gc], scores1[gc]);
             }
+            apply_per_thread_qk_score_scale<PerThreadQK, PvOrderedQK>(scores0[gc], q_scale, k_scale, b, hq, hkv, q_start[0], kb_base,
+                col_tile, lane, qo_len, kv_len, qs_stride_b, qs_stride_h,
+                ks_stride_b, ks_stride_h, sm_scale);
+            apply_per_thread_qk_score_scale<PerThreadQK, PvOrderedQK>(scores1[gc], q_scale, k_scale, b, hq, hkv, q_start[1], kb_base,
+                col_tile, lane, qo_len, kv_len, qs_stride_b, qs_stride_h,
+                ks_stride_b, ks_stride_h, sm_scale);
             if constexpr (ApplyCausalMask) {
               if (fully_future0) {
 #pragma unroll
@@ -2419,9 +2549,11 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
           } else {
             float k_scale_local = prepared_k_scale_tile;
             if constexpr (!QuantizeKey && BC > 64) {
-              const int k_scale_idx = k_scale_col_per_warp(k_col_start);
-              k_scale_local =
-                  k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+              if constexpr (!PerThreadQK) {
+                const int k_scale_idx = k_scale_col_per_warp(k_col_start);
+                k_scale_local =
+                    k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+              }
             }
             if constexpr (UseLaneMajorKey) {
               compute_tqk_score_regs_raw_kq_2_lane_shared_key<DTiles>(
@@ -2434,6 +2566,12 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                   qs[0] * k_scale_local, qs[1] * k_scale_local,
                   !fully_future0, !fully_future1, scores0, scores1);
             }
+            apply_per_thread_qk_score_scale<PerThreadQK, PvOrderedQK>(scores0, q_scale, k_scale, b, hq, hkv, q_start[0], kb_base,
+                col_tile, lane, qo_len, kv_len, qs_stride_b, qs_stride_h,
+                ks_stride_b, ks_stride_h, sm_scale);
+            apply_per_thread_qk_score_scale<PerThreadQK, PvOrderedQK>(scores1, q_scale, k_scale, b, hq, hkv, q_start[1], kb_base,
+                col_tile, lane, qo_len, kv_len, qs_stride_b, qs_stride_h,
+                ks_stride_b, ks_stride_h, sm_scale);
             if constexpr (ApplyCausalMask) {
               if (fully_future0) {
 #pragma unroll
@@ -2550,14 +2688,19 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
             } else {
               float k_scale_local = prepared_k_scale_tile;
               if constexpr (!QuantizeKey && BC > 64) {
-                const int k_scale_idx = k_scale_col_per_warp(k_col_start);
-                k_scale_local =
-                    k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+                if constexpr (!PerThreadQK) {
+                  const int k_scale_idx = k_scale_col_per_warp(k_col_start);
+                  k_scale_local =
+                      k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+                }
               }
               const float score_scale = qs[qg] * k_scale_local;
               scores =
                   compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
                       &k_tile[0][0], q_frag[qg], col_tile, score_scale);
+              apply_per_thread_qk_score_scale<PerThreadQK, false>(scores, q_scale, k_scale, b, hq, hkv, q_start[qg], kb_base,
+                  col_tile, lane, qo_len, kv_len, qs_stride_b, qs_stride_h,
+                  ks_stride_b, ks_stride_h, sm_scale);
               if constexpr (ApplyCausalMask) {
                 const bool needs_causal_mask = k_col_start + BK > q_start[qg];
                 if (needs_causal_mask) {
@@ -2696,9 +2839,11 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
         for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
           float k_scale_local = prepared_k_scale_tile;
           if constexpr (!QuantizeKey && BC > 64) {
-            const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * BK);
-            k_scale_local =
-                k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+            if constexpr (!PerThreadQK) {
+              const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * BK);
+              k_scale_local =
+                  k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+            }
           }
           const float score_scale = qs[qg] * k_scale_local;
           float8_vec scores;
@@ -2710,6 +2855,9 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                 compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
                     &k_tile[0][0], q_frag[qg], col_tile, score_scale);
           }
+          apply_per_thread_qk_score_scale<PerThreadQK, false>(scores, q_scale, k_scale, b, hq, hkv, q_start[qg], kb_base,
+              col_tile, lane, qo_len, kv_len, qs_stride_b, qs_stride_h,
+              ks_stride_b, ks_stride_h, sm_scale);
           if constexpr (ApplyCausalMask) {
             if (needs_causal_mask) {
               apply_tqk_causal_mask<true>(
@@ -2750,9 +2898,11 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
         for (int col_tile = 0; col_tile < ColTiles; ++col_tile) {
           float k_scale_local = prepared_k_scale_tile;
           if constexpr (!QuantizeKey && BC > 64) {
-            const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * BK);
-            k_scale_local =
-                k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+            if constexpr (!PerThreadQK) {
+              const int k_scale_idx = k_scale_col_per_warp(kb_base + col_tile * BK);
+              k_scale_local =
+                  k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+            }
           }
           const float score_scale = qs[qg] * k_scale_local;
           float8_vec scores;
@@ -2764,6 +2914,9 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                 compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
                     &k_tile[0][0], q_frag[qg], col_tile, score_scale);
           }
+          apply_per_thread_qk_score_scale<PerThreadQK, false>(scores, q_scale, k_scale, b, hq, hkv, q_start[qg], kb_base,
+              col_tile, lane, qo_len, kv_len, qs_stride_b, qs_stride_h,
+              ks_stride_b, ks_stride_h, sm_scale);
           if constexpr (ApplyCausalMask) {
             if (needs_causal_mask) {
               apply_tqk_causal_mask<true>(
@@ -2898,7 +3051,8 @@ template <int BlockCols,
           bool PrepackedLaneMajorKeyOnly = false,
           bool PrepackedLaneMajorValueOnly = false,
           int QGroupsParam = 2,
-          bool LowPressureQGroups = false>
+          bool LowPressureQGroups = false,
+          bool PerThreadQK = false>
 SAGEATTN_NATIVE_2Q_WAVES_PER_EU(HeadDim, IsCausal)
 __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_f8_native_2q_kernel(
     const QueryT* __restrict__ q,
@@ -2930,7 +3084,8 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
     const int64_t ks_stride_b,
     const int64_t ks_stride_h,
     const int tensor_layout,
-    const float sm_scale) {
+    const float sm_scale,
+    const bool per_thread_qk = false) {
   static_assert(HeadDim == 16 || HeadDim == 64 || HeadDim == 128,
                 "native gfx12 fp8 2q kernel supports D16/D64/D128.");
   static_assert(BlockCols == 16 || BlockCols == 32 || BlockCols == 64 ||
@@ -3100,9 +3255,13 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
   } else {
 #pragma unroll
     for (int qg = 0; qg < QGroups; ++qg) {
-      const int q_scale_idx = q_scale_col_per_warp(q_start[qg]);
-      qs[qg] = q_scale[b * qs_stride_b + hq * qs_stride_h + q_scale_idx] *
-          sm_scale * kLog2e;
+      if constexpr (PerThreadQK) {
+        qs[qg] = 1.0f;
+      } else {
+        const int q_scale_idx = q_scale_col_per_warp(q_start[qg]);
+        qs[qg] = q_scale[b * qs_stride_b + hq * qs_stride_h + q_scale_idx] *
+            sm_scale * kLog2e;
+      }
     }
     if constexpr (UsePrepackedLaneMajorK) {
 #pragma unroll
@@ -3304,9 +3463,11 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
             }
             float prepared_k_scale_tile = k_scale_tile;
             if constexpr (!QuantizeKeyValue && BC <= 64) {
-              const int k_scale_idx = k_scale_col_per_warp(kb_base);
-              prepared_k_scale_tile =
-                  k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+              if constexpr (!PerThreadQK) {
+                const int k_scale_idx = k_scale_col_per_warp(kb_base);
+                prepared_k_scale_tile =
+                    k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+              }
             }
 #pragma unroll
             for (int sc = 0; sc < StreamCols; ++sc) {
@@ -3344,10 +3505,14 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
               }
               float k_scale_local = k_scale_tile;
               if constexpr (!QuantizeKeyValue && BC <= 64) {
-                k_scale_local = prepared_k_scale_tile;
+                if constexpr (!PerThreadQK) {
+                  k_scale_local = prepared_k_scale_tile;
+                }
               } else if constexpr (!QuantizeKeyValue) {
-                const int k_scale_idx = k_scale_col_per_warp(k_col_start);
-                k_scale_local = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+                if constexpr (!PerThreadQK) {
+                  const int k_scale_idx = k_scale_col_per_warp(k_col_start);
+                  k_scale_local = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+                }
               }
               if constexpr (QuantizeQuery || UsePrepackedLaneMajorK) {
               i32x8_vec score_acc[QGroups];
@@ -3390,6 +3555,9 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
                   for (int elem = 0; elem < 8; ++elem) {
                     scores[elem] = static_cast<float>(score_acc[qg][elem]) * score_scale;
                   }
+                  apply_per_thread_qk_score_scale<PerThreadQK, false>(scores, q_scale, k_scale, b, hq, hkv, q_start[qg], kb_base,
+                      col_tile, lane, qo_len, kv_len, qs_stride_b, qs_stride_h,
+                      ks_stride_b, ks_stride_h, sm_scale);
                   if constexpr (ApplyCausalMask) {
                     const bool needs_causal_mask = k_col_start + BK > q_start[qg];
                     if (needs_causal_mask) {
@@ -3444,6 +3612,9 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
                     for (int elem = 0; elem < 8; ++elem) {
                       scores[elem] = static_cast<float>(score_rm[elem]) * score_scale;
                     }
+                    apply_per_thread_qk_score_scale<PerThreadQK, false>(scores, q_scale, k_scale, b, hq, hkv, q_start[qg], kb_base,
+                        col_tile, lane, qo_len, kv_len, qs_stride_b, qs_stride_h,
+                        ks_stride_b, ks_stride_h, sm_scale);
                     if constexpr (ApplyCausalMask) {
                       const bool needs_causal_mask = k_col_start + BK > q_start[qg];
                       if (needs_causal_mask) {
@@ -3588,9 +3759,11 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
         float local_max[QGroups];
         float prepared_k_scale_tile = k_scale_tile;
         if constexpr (!QuantizeKeyValue && BC <= 64) {
-          const int k_scale_idx = k_scale_col_per_warp(kb_base);
-          prepared_k_scale_tile =
-              k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+          if constexpr (!PerThreadQK) {
+            const int k_scale_idx = k_scale_col_per_warp(kb_base);
+            prepared_k_scale_tile =
+                k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+          }
         }
 #pragma unroll
         for (int qg = 0; qg < QGroups; ++qg) {
@@ -3628,10 +3801,14 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
           }
           float k_scale_local = k_scale_tile;
           if constexpr (!QuantizeKeyValue && BC <= 64) {
-            k_scale_local = prepared_k_scale_tile;
+            if constexpr (!PerThreadQK) {
+              k_scale_local = prepared_k_scale_tile;
+            }
           } else if constexpr (!QuantizeKeyValue) {
-            const int k_scale_idx = k_scale_col_per_warp(k_col_start);
-            k_scale_local = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+            if constexpr (!PerThreadQK) {
+              const int k_scale_idx = k_scale_col_per_warp(k_col_start);
+              k_scale_local = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+            }
           }
           i32x8_vec score_acc[QGroups];
 #pragma unroll
@@ -3681,6 +3858,9 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
               for (int elem = 0; elem < 8; ++elem) {
                 scores[elem] = static_cast<float>(score_acc[qg][elem]) * score_scale;
               }
+              apply_per_thread_qk_score_scale<PerThreadQK, false>(scores, q_scale, k_scale, b, hq, hkv, q_start[qg], kb_base,
+                  col_tile, lane, qo_len, kv_len, qs_stride_b, qs_stride_h,
+                  ks_stride_b, ks_stride_h, sm_scale);
               if constexpr (ApplyCausalMask) {
                 const bool needs_causal_mask = k_col_start + BK > q_start[qg];
                 if (needs_causal_mask) {
@@ -3776,8 +3956,10 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
           } else {
             float k_scale_local = k_scale_tile;
             if constexpr (!QuantizeKeyValue) {
-              const int k_scale_idx = k_scale_col_per_warp(k_col_start);
-              k_scale_local = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+              if constexpr (!PerThreadQK) {
+                const int k_scale_idx = k_scale_col_per_warp(k_col_start);
+                k_scale_local = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+              }
             }
             const float score_scale = qs[qg] * k_scale_local;
             if constexpr (QuantizeQuery) {
@@ -3788,6 +3970,9 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
                   compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
                       &k_tile[0][0], q_frag[qg], col_tile, score_scale);
             }
+            apply_per_thread_qk_score_scale<PerThreadQK, false>(scores, q_scale, k_scale, b, hq, hkv, q_start[qg], kb_base,
+                col_tile, lane, qo_len, kv_len, qs_stride_b, qs_stride_h,
+                ks_stride_b, ks_stride_h, sm_scale);
             if constexpr (ApplyCausalMask) {
               const bool needs_causal_mask = k_col_start + BK > q_start[qg];
               if (needs_causal_mask) {
@@ -3932,8 +4117,10 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
           } else {
             float k_scale_local = k_scale_tile;
             if constexpr (!QuantizeKeyValue) {
-              const int k_scale_idx = k_scale_col_per_warp(k_col_start);
-              k_scale_local = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+              if constexpr (!PerThreadQK) {
+                const int k_scale_idx = k_scale_col_per_warp(k_col_start);
+                k_scale_local = k_scale[b * ks_stride_b + hkv * ks_stride_h + k_scale_idx];
+              }
             }
             const float score_scale = qs[qg] * k_scale_local;
             if constexpr (QuantizeQuery) {
@@ -3944,6 +4131,9 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
                   compute_tqk_score_regs<DTiles, SharedHeadStride, FragK, FragQ, FragScoreT>(
                       &k_tile[0][0], q_frag[qg], col_tile, score_scale);
             }
+            apply_per_thread_qk_score_scale<PerThreadQK, false>(scores, q_scale, k_scale, b, hq, hkv, q_start[qg], kb_base,
+                col_tile, lane, qo_len, kv_len, qs_stride_b, qs_stride_h,
+                ks_stride_b, ks_stride_h, sm_scale);
             if constexpr (ApplyCausalMask) {
               const bool needs_causal_mask = k_col_start + BK > q_start[qg];
               if (needs_causal_mask) {
@@ -5888,6 +6078,7 @@ std::vector<torch::Tensor> quant_qk_int8_hnd_gfx12(torch::Tensor query, torch::T
   return {query_out, query_scale, key_out, key_scale};
 }
 
+template <bool PerThreadQK = false>
 static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     torch::Tensor query,
     torch::Tensor key,
@@ -6488,6 +6679,7 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
   return output;
 }
 
+template <bool PerThreadQK>
 static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     torch::Tensor query,
     torch::Tensor key,
@@ -6547,6 +6739,29 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   TORCH_CHECK((q_heads % kv_heads) == 0, "q_heads must be divisible by kv_heads");
   TORCH_CHECK(query_scale.stride(-1) == 1 && key_scale.stride(-1) == 1,
               "scale tensors must have contiguous scale columns");
+  const int64_t per_warp_q_groups = ((q_len + 127) / 128) * 4;
+  const int64_t per_thread_q_groups_warp32 = ((q_len + 127) / 128) * 32;
+  const int64_t per_thread_q_groups_warp16 = ((q_len + 127) / 128) * 64;
+  const int64_t per_warp_k_groups = (padded_kv_len + 63) / 64;
+  const int64_t per_thread_k_groups = ((padded_kv_len + 63) / 64) * 4;
+  const bool use_per_thread_qk =
+      query_scale.size(2) == per_thread_q_groups_warp32 ||
+      query_scale.size(2) == per_thread_q_groups_warp16 ||
+      key_scale.size(2) == per_thread_k_groups;
+  TORCH_CHECK((query_scale.size(2) == per_warp_q_groups &&
+               key_scale.size(2) == per_warp_k_groups) ||
+              ((query_scale.size(2) == per_thread_q_groups_warp32 ||
+                query_scale.size(2) == per_thread_q_groups_warp16) &&
+               key_scale.size(2) == per_thread_k_groups),
+              "gfx12 query/key scale shapes must both be per-warp or both be per-thread");
+  if constexpr (!PerThreadQK) {
+    if (use_per_thread_qk) {
+      return qk_int8_sv_f16_d64_native_attn_gfx12_impl<true>(
+          query, key, value, output, query_scale, key_scale, tensor_layout,
+          is_causal, sm_scale, valid_kv_len, value_scale,
+          value_transposed_hnd_hint);
+    }
+  }
   const bool has_value_scale = value_scale.defined() && value_scale.numel() > 0;
   TORCH_CHECK(!has_value_scale || value_is_fp8,
               "value_scale is only valid for the fp8 value path");
@@ -6621,6 +6836,13 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       q_len >= 4096 && (q_len % 256) == 0) {
     block_rows = 256;
   }
+  if constexpr (PerThreadQK) {
+    block_cols = 64;
+    block_rows = q_len <= 64 ? 64 : 128;
+    use_2q = !value_is_fp8;
+    use_fp8_2q = value_is_fp8;
+    use_f16_causal_1q = false;
+  }
   TORCH_CHECK(!(use_fp8_2q && block_rows == 64 && block_cols == 128),
               "native fp8 2q BR64 is currently specialized for BC32/BC64");
   TORCH_CHECK(!(use_fp8_2q && block_rows == 256 && block_cols != 64),
@@ -6661,6 +6883,67 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   const bool use_f16_streamk =
       head_dim == 64 && !value_is_fp8 && is_causal && value_transposed_hnd &&
       q_len == 4096 && block_rows == 256;
+  if constexpr (PerThreadQK) {
+    TORCH_CHECK(value_transposed_hnd,
+                "gfx12 per-thread QK path expects transposed HND values");
+#define SAGEATTN_LAUNCH_PERTHREAD_FP8_OUT(HD_, BR_, CAUSAL_, OUT_T_) \
+    qk_int8_sv_f8_native_2q_kernel<64, HD_, 0, ((HD_) / 16), true, BR_, true, CAUSAL_, OUT_T_, int8_t, false, int8_t, uint8_t, false, false, 0, false, false, 2, false, true><<<grid, block, 0, stream>>>( \
+        query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
+        value.data_ptr<uint8_t>(), \
+        reinterpret_cast<OUT_T_*>(output.data_ptr()), \
+        query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), value_scale_ptr, \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+        value.stride(0), value.stride(2), value.stride(1), \
+        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+        query_scale.stride(0), query_scale.stride(1), \
+        key_scale.stride(0), key_scale.stride(1), \
+        tensor_layout, sm_scale, true)
+#define SAGEATTN_LAUNCH_PERTHREAD_FP8(HD_, BR_, CAUSAL_) \
+    if (output_is_bf16) { \
+      SAGEATTN_LAUNCH_PERTHREAD_FP8_OUT(HD_, BR_, CAUSAL_, __hip_bfloat16); \
+    } else { \
+      SAGEATTN_LAUNCH_PERTHREAD_FP8_OUT(HD_, BR_, CAUSAL_, __half); \
+    }
+#define SAGEATTN_LAUNCH_PERTHREAD_F16(HD_, BR_, CAUSAL_) \
+    qk_int8_sv_f16_d64_native_2q_kernel<64, true, BR_, true, 4, CAUSAL_, false, false, int8_t, false, int8_t, false, false, false, false, false, HD_, false, true><<<grid, block, 0, stream>>>( \
+        query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
+        reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
+        reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
+        query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+        value.stride(0), value.stride(2), value.stride(1), \
+        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+        query_scale.stride(0), query_scale.stride(1), \
+        key_scale.stride(0), key_scale.stride(1), \
+        tensor_layout, sm_scale, true)
+#define SAGEATTN_DISPATCH_PERTHREAD_HEADS(BR_, CAUSAL_) \
+    if (value_is_fp8) { \
+      if (head_dim == 16) { SAGEATTN_LAUNCH_PERTHREAD_FP8(16, BR_, CAUSAL_); } \
+      else if (head_dim == 64) { SAGEATTN_LAUNCH_PERTHREAD_FP8(64, BR_, CAUSAL_); } \
+      else { SAGEATTN_LAUNCH_PERTHREAD_FP8(128, BR_, CAUSAL_); } \
+    } else { \
+      if (head_dim == 16) { SAGEATTN_LAUNCH_PERTHREAD_F16(16, BR_, CAUSAL_); } \
+      else if (head_dim == 64) { SAGEATTN_LAUNCH_PERTHREAD_F16(64, BR_, CAUSAL_); } \
+      else { SAGEATTN_LAUNCH_PERTHREAD_F16(128, BR_, CAUSAL_); } \
+    }
+    if (block_rows == 64) {
+      if (is_causal) { SAGEATTN_DISPATCH_PERTHREAD_HEADS(64, true); }
+      else { SAGEATTN_DISPATCH_PERTHREAD_HEADS(64, false); }
+    } else {
+      if (is_causal) { SAGEATTN_DISPATCH_PERTHREAD_HEADS(128, true); }
+      else { SAGEATTN_DISPATCH_PERTHREAD_HEADS(128, false); }
+    }
+#undef SAGEATTN_DISPATCH_PERTHREAD_HEADS
+#undef SAGEATTN_LAUNCH_PERTHREAD_F16
+#undef SAGEATTN_LAUNCH_PERTHREAD_FP8
+#undef SAGEATTN_LAUNCH_PERTHREAD_FP8_OUT
+    hip_kernel_launch_check();
+    return output;
+  }
 #define SAGEATTN_LAUNCH_FP8_2Q_OUT(BC_, HD_, HND_, BR_, OUT_T_) \
   if (is_causal) { \
     qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, false, true, OUT_T_><<<grid, block, 0, stream>>>( \
@@ -6675,7 +6958,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
       query_scale.stride(0), query_scale.stride(1), \
       key_scale.stride(0), key_scale.stride(1), \
-      tensor_layout, sm_scale); \
+      tensor_layout, sm_scale, use_per_thread_qk); \
   } else { \
     qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), HND_, BR_, false, false, OUT_T_><<<grid, block, 0, stream>>>( \
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
@@ -6689,7 +6972,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
       query_scale.stride(0), query_scale.stride(1), \
       key_scale.stride(0), key_scale.stride(1), \
-      tensor_layout, sm_scale); \
+      tensor_layout, sm_scale, use_per_thread_qk); \
   }
 #define SAGEATTN_LAUNCH_FP8_2Q(BC_, HD_, HND_, BR_) \
   if (output_is_bf16) { \
@@ -6711,7 +6994,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
       query_scale.stride(0), query_scale.stride(1), \
       key_scale.stride(0), key_scale.stride(1), \
-      tensor_layout, sm_scale); \
+      tensor_layout, sm_scale, use_per_thread_qk); \
   } else { \
     qk_int8_sv_f8_native_2q_kernel<BC_, HD_, 0, ((HD_) / 16), true, BR_, true, false, OUT_T_><<<grid, block, 0, stream>>>( \
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
@@ -6725,7 +7008,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
       query_scale.stride(0), query_scale.stride(1), \
       key_scale.stride(0), key_scale.stride(1), \
-      tensor_layout, sm_scale); \
+      tensor_layout, sm_scale, use_per_thread_qk); \
   }
 #define SAGEATTN_LAUNCH_FP8_2Q_TV(BC_, HD_, BR_) \
   if (output_is_bf16) { \
@@ -6746,7 +7029,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
       query_scale.stride(0), query_scale.stride(1), \
       key_scale.stride(0), key_scale.stride(1), \
-      tensor_layout, sm_scale)
+      tensor_layout, sm_scale, use_per_thread_qk)
 #define SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, GRID_, FLAT_) \
   SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID_HD(64, BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_, GRID_, FLAT_)
 #define SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL(BC_, BR_, PAD_, F16ACC_, PVORDER_, VLANE_, STREAM_, KLANE_) \
@@ -6768,7 +7051,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
       query_scale.stride(0), query_scale.stride(1), \
       key_scale.stride(0), key_scale.stride(1), \
-      tensor_layout, sm_scale)
+      tensor_layout, sm_scale, use_per_thread_qk)
 #define SAGEATTN_LAUNCH_F16_D128_2Q_TV(BC_, BR_, PAD_) \
   if (is_causal) { \
     SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID_HD(128, BC_, BR_, PAD_, false, false, false, false, false, grid, false); \
@@ -6785,7 +7068,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
         query_scale.stride(0), query_scale.stride(1), \
         key_scale.stride(0), key_scale.stride(1), \
-        tensor_layout, sm_scale); \
+        tensor_layout, sm_scale, use_per_thread_qk); \
   }
 #define SAGEATTN_LAUNCH_F16_2Q_TV(BC_, BR_, PAD_) \
   if (is_causal) { \
@@ -6820,7 +7103,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
         query_scale.stride(0), query_scale.stride(1), \
         key_scale.stride(0), key_scale.stride(1), \
-        tensor_layout, sm_scale); \
+        tensor_layout, sm_scale, use_per_thread_qk); \
   }
 #define SAGEATTN_LAUNCH_F16_2Q(BC_, HND_, BR_) \
   if (is_causal) { \
@@ -6836,7 +7119,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
         query_scale.stride(0), query_scale.stride(1), \
         key_scale.stride(0), key_scale.stride(1), \
-        tensor_layout, sm_scale); \
+        tensor_layout, sm_scale, use_per_thread_qk); \
   } else { \
     qk_int8_sv_f16_d64_native_2q_kernel<BC_, HND_, BR_><<<grid, block, 0, stream>>>( \
         query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
@@ -6850,7 +7133,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
         query_scale.stride(0), query_scale.stride(1), \
         key_scale.stride(0), key_scale.stride(1), \
-        tensor_layout, sm_scale); \
+        tensor_layout, sm_scale, use_per_thread_qk); \
   }
 #define SAGEATTN_LAUNCH_F16_2Q_TVLOAD_CAUSAL(BC_, BR_, PAD_, F16ACC_) \
     qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, false, PAD_, true, true, F16ACC_><<<grid, block, 0, stream>>>( \
@@ -6865,7 +7148,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
         query_scale.stride(0), query_scale.stride(1), \
         key_scale.stride(0), key_scale.stride(1), \
-        tensor_layout, sm_scale)
+        tensor_layout, sm_scale, use_per_thread_qk)
 #define SAGEATTN_LAUNCH_F16_2Q_TVLOAD(BC_, BR_, PAD_) \
   if (is_causal) { \
     SAGEATTN_LAUNCH_F16_2Q_TVLOAD_CAUSAL(BC_, BR_, PAD_, false); \
@@ -6882,7 +7165,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
         query_scale.stride(0), query_scale.stride(1), \
         key_scale.stride(0), key_scale.stride(1), \
-        tensor_layout, sm_scale); \
+        tensor_layout, sm_scale, use_per_thread_qk); \
   }
 #define SAGEATTN_LAUNCH_F16_1Q(BC_, BR_) \
   qk_int8_sv_f16_d64_native_kernel<BC_, BR_><<<grid, block, 0, stream>>>( \
@@ -6897,7 +7180,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
       query_scale.stride(0), query_scale.stride(1), \
       key_scale.stride(0), key_scale.stride(1), \
-      tensor_layout, sm_scale)
+      tensor_layout, sm_scale, use_per_thread_qk)
 #define SAGEATTN_LAUNCH_F16_1Q_CAUSAL(BR_, TRANSPOSED_, TVLOAD_, PAD_, F16ACC_) \
   qk_int8_sv_f16_d64_native_kernel<64, BR_, true, TRANSPOSED_, PAD_, true, TVLOAD_, F16ACC_><<<grid, block, 0, stream>>>( \
       query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
@@ -6912,7 +7195,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
       query_scale.stride(0), query_scale.stride(1), \
       key_scale.stride(0), key_scale.stride(1), \
-      tensor_layout, sm_scale)
+      tensor_layout, sm_scale, use_per_thread_qk)
   if (use_f16_causal_1q) {
     TORCH_CHECK(hnd_contiguous, "fp16 single-q causal path requires contiguous HND tensors");
     const bool use_f16_1q_pv_accum = use_f16_pv_accum;
@@ -7073,7 +7356,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1),
         query_scale.stride(0), query_scale.stride(1),
         key_scale.stride(0), key_scale.stride(1),
-        tensor_layout, sm_scale);
+        tensor_layout, sm_scale, use_per_thread_qk);
   } else if (use_fp8_2q && block_cols == 128) {
     qk_int8_sv_f8_native_2q_kernel<128, 64, 0, 4><<<grid, block, 0, stream>>>(
         query.data_ptr<int8_t>(), key.data_ptr<int8_t>(),
@@ -7087,7 +7370,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1),
         query_scale.stride(0), query_scale.stride(1),
         key_scale.stride(0), key_scale.stride(1),
-        tensor_layout, sm_scale);
+        tensor_layout, sm_scale, use_per_thread_qk);
   } else if (use_fp8_2q && head_dim == 128) {
     if (hnd_contiguous) {
       SAGEATTN_LAUNCH_FP8_2Q(64, 128, true, 128);
