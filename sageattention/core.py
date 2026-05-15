@@ -101,11 +101,6 @@ def _get_gfx12_native_extension():
     return _qattn_gfx12_native
 
 
-def _get_gfx12_prepare_attn_hnd():
-    _get_gfx12_native_extension()
-    return _qattn_gfx12_prepare_attn_hnd
-
-
 def _round_up_to_multiple(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
@@ -192,6 +187,12 @@ def _gfx12_normalize_v2_options(
         warnings.warn(f"pv_accum_dtype is {pv_accum_dtype}, smooth_v will be ignored.")
         smooth_v = False
     return value_dtype_normalized, pv_accum_dtype, smooth_v, _GFX12_FP8_VALUE_SCALE_MAX_FP32_FP16
+
+
+def _gfx12_pv_accum_mode(value_dtype: str, pv_accum_dtype: str) -> int:
+    if value_dtype != "fp16":
+        return -1
+    return 1 if pv_accum_dtype == "fp16" else 0
 
 
 def _gfx12_apply_smooth_v(
@@ -306,6 +307,7 @@ def sageattn_qk_int8_pv_gfx12_native(
     value_dtype_normalized, pv_accum_dtype, smooth_v, fp8_value_scale_max = (
         _gfx12_normalize_v2_options(value_dtype, pv_accum_dtype, smooth_v)
     )
+    pv_accum_mode = _gfx12_pv_accum_mode(value_dtype_normalized, pv_accum_dtype)
     gfx12_native = _get_gfx12_native_extension()
     gfx12_prepare_attn_hnd = _qattn_gfx12_prepare_attn_hnd
 
@@ -334,44 +336,10 @@ def sageattn_qk_int8_pv_gfx12_native(
             lse_q, lse_k, tensor_layout, bool(is_causal), lse_sm_scale
         )
 
-    if (
-        tensor_layout == "HND"
-        and value_dtype_normalized == "fp16"
-        and not smooth_k
-        and not return_lse
-        and smooth_v_mean is None
-        and q.dim() == 4
-        and k.dim() == 4
-        and v.dim() == 4
-        and q.is_cuda
-        and q.is_contiguous()
-        and k.is_contiguous()
-        and v.is_contiguous()
-        and q.dtype == torch.float16
-        and q.dtype == k.dtype == v.dtype
-        and q.device == k.device == v.device
-        and q.size(-1) in (16, 64)
-        and q.size(2) % 64 == 0
-        and k.size(2) % 64 == 0
-    ):
-        torch.cuda.set_device(v.device)
-        use_raw_f16_value = is_causal and q.size(-1) == 64 and q.size(2) <= 512
-        return gfx12_prepare_attn_hnd(
-            q,
-            k,
-            v,
-            int(is_causal),
-            0,
-            int(use_raw_f16_value),
-            float(sm_scale if sm_scale is not None else q.size(-1) ** -0.5),
-        )
-
     torch.cuda.set_device(v.device)
 
     assert v.dtype in [torch.float16, torch.bfloat16], "gfx12 native path supports fp16/bf16 value inputs."
     value_dtype = value_dtype_normalized
-    if value_dtype not in {"fp16", "fp8"}:
-        raise ValueError("gfx12 native value_dtype must be 'auto', 'fp16', or 'fp8'.")
     if sm_scale is None and q.dim() == 4:
         sm_scale = q.size(-1) ** -0.5
 
@@ -381,6 +349,7 @@ def sageattn_qk_int8_pv_gfx12_native(
         and q.dim() == 4
         and k.dim() == 4
         and v.dim() == 4
+        and q.dtype == k.dtype == v.dtype
         and q.is_contiguous()
         and k.is_contiguous()
         and v.is_contiguous()
@@ -405,6 +374,8 @@ def sageattn_qk_int8_pv_gfx12_native(
             int(value_dtype == "fp8"),
             int(use_raw_f16_value),
             float(sm_scale),
+            0,
+            pv_accum_mode,
         )
         if input_dtype == torch.bfloat16:
             out = out if out.dtype == torch.bfloat16 else gfx12_native.convert_f16_to_bf16(out)
@@ -509,6 +480,7 @@ def sageattn_qk_int8_pv_gfx12_native(
                 float(sm_scale),
                 kv_len,
                 0,
+                pv_accum_mode,
             )
         out = out[:, :qo_len, :, :head_dim_og]
         if input_dtype == torch.bfloat16 and out.dtype != torch.bfloat16:
@@ -534,7 +506,9 @@ def sageattn_qk_int8_pv_gfx12_native(
         raise ValueError("gfx12 causal path currently requires q_len == kv_len.")
 
     head_dim = head_dim_og
-    if head_dim < 64 and (smooth_k or head_dim != 16):
+    if head_dim < 64 and (
+        smooth_k or head_dim != 16 or value_dtype == "fp8" or q_hnd.dtype != v_hnd.dtype
+    ):
         pad = 64 - head_dim
         q_hnd = F.pad(q_hnd, (0, pad))
         k_hnd = F.pad(k_hnd, (0, pad))
@@ -587,7 +561,7 @@ def sageattn_qk_int8_pv_gfx12_native(
                 1, int(is_causal), float(sm_scale), kv_len
             )
         else:
-            if qk_quant_gran == "per_warp":
+            if qk_quant_gran == "per_warp" and q_hnd.dtype == k_hnd.dtype == v_hnd.dtype:
                 out = gfx12_prepare_attn_hnd(
                     q_hnd,
                     k_hnd,
@@ -597,6 +571,7 @@ def sageattn_qk_int8_pv_gfx12_native(
                     int(use_raw_f16_value),
                     float(sm_scale),
                     kv_len,
+                    pv_accum_mode,
                 )
             else:
                 q_int8, q_scale, k_int8, k_scale = _quant_qk_hnd(q_hnd, k_hnd, None)
@@ -604,7 +579,8 @@ def sageattn_qk_int8_pv_gfx12_native(
                 out = torch.empty_like(q_hnd, dtype=torch.float16)
                 gfx12_native.qk_int8_sv_f16_d64_native_attn(
                     q_int8, k_int8, value_native, out, q_scale, k_scale,
-                    1, int(is_causal), float(sm_scale), kv_len, 1
+                    1, int(is_causal), float(sm_scale), kv_len, 1,
+                    pv_accum_mode
                 )
     else:
         use_rawq_hnd_fp8 = (
@@ -657,7 +633,8 @@ def sageattn_qk_int8_pv_gfx12_native(
             value_native = gfx12_native.transpose_value_f16_hnd(v_hnd)
             gfx12_native.qk_int8_sv_f16_d64_native_attn(
                 q_int8, k_int8, value_native, out, q_scale, k_scale,
-                1, int(is_causal), float(sm_scale), kv_len, 1
+                1, int(is_causal), float(sm_scale), kv_len, 1,
+                pv_accum_mode
             )
     out = out[..., :qo_len, :head_dim_og]
     if input_dtype == torch.bfloat16 and out.dtype != torch.bfloat16:

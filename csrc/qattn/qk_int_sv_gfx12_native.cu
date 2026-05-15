@@ -6091,7 +6091,8 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     float sm_scale,
     int64_t valid_kv_len,
     torch::Tensor value_scale = torch::Tensor(),
-    int value_transposed_hnd_hint = -1);
+    int value_transposed_hnd_hint = -1,
+    int pv_accum_mode = -1);
 
 torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     torch::Tensor query,
@@ -6101,7 +6102,8 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     int value_is_fp8,
     int use_raw_f16_value,
     float sm_scale,
-    int64_t valid_kv_len) {
+    int64_t valid_kv_len,
+    int pv_accum_mode) {
   TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda(),
               "native gfx12 prepare+attention expects CUDA/HIP tensors");
   TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4,
@@ -6137,6 +6139,8 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
               "native gfx12 prepare+attention requires sequence lengths divisible by 64");
   TORCH_CHECK(!is_causal || q_len == padded_kv_len,
               "native gfx12 causal prepare+attention requires q_len == kv_len");
+  TORCH_CHECK(pv_accum_mode >= -1 && pv_accum_mode <= 1,
+              "invalid gfx12 fp16 PV accumulation mode");
 
   const auto output_dtype =
       (value_is_fp8 && query.scalar_type() == torch::kBFloat16) ? torch::kBFloat16 : torch::kFloat16;
@@ -6144,17 +6148,18 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
   if (!value_is_fp8) {
     output = torch::empty_like(query, query.options().dtype(output_dtype));
   }
+  const bool force_fp32_pv_accum = !value_is_fp8 && pv_accum_mode == 0;
   const bool prefer_prepared_f16_causal =
-      !value_is_fp8 && head_dim == 64 && is_causal &&
+      !force_fp32_pv_accum && !value_is_fp8 && head_dim == 64 && is_causal &&
       query.scalar_type() == torch::kFloat16 && q_len >= 4096;
   const bool auto_f16_fused_q =
-      !value_is_fp8 && (head_dim == 16 || head_dim == 64) &&
+      !force_fp32_pv_accum && !value_is_fp8 && (head_dim == 16 || head_dim == 64) &&
       query.scalar_type() == torch::kFloat16 &&
       (is_causal || q_len >= 2048 || (head_dim == 64 && q_len >= 1024)) &&
       q_len <= 8192 &&
       !prefer_prepared_f16_causal;
   const bool auto_f16_raw_qk =
-      !value_is_fp8 && is_causal && head_dim == 16 &&
+      !force_fp32_pv_accum && !value_is_fp8 && is_causal && head_dim == 16 &&
       query.scalar_type() == torch::kFloat16 && q_len <= 2048;
   if (!value_is_fp8 && is_causal && (head_dim == 16 || head_dim == 64) &&
       query.scalar_type() == torch::kFloat16 &&
@@ -6663,7 +6668,8 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     std::vector<torch::Tensor> prepared = quant_qk_int8_hnd_gfx12(query, key);
     qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         prepared[0], prepared[2], value, output, prepared[1], prepared[3],
-        kHND, is_causal, sm_scale, kv_len, torch::Tensor(), 0);
+        kHND, is_causal, sm_scale, kv_len, torch::Tensor(), 0,
+        pv_accum_mode);
   } else {
     const bool use_f16_separate_prepared =
         is_causal && head_dim == 64 && q_len == 4096 &&
@@ -6674,7 +6680,8 @@ torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
              prepare_qkv_hnd_packed_gfx12<__half, false>(query, key, value);
     qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         prepared[0], prepared[2], prepared[4], output, prepared[1], prepared[3],
-        kHND, is_causal, sm_scale, kv_len, torch::Tensor(), 1);
+        kHND, is_causal, sm_scale, kv_len, torch::Tensor(), 1,
+        pv_accum_mode);
   }
   return output;
 }
@@ -6692,7 +6699,8 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
     float sm_scale,
     int64_t valid_kv_len,
     torch::Tensor value_scale,
-    int value_transposed_hnd_hint) {
+    int value_transposed_hnd_hint,
+    int pv_accum_mode) {
   TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && output.is_cuda(),
               "native gfx12 tensors must be CUDA/HIP tensors");
   TORCH_CHECK(query.scalar_type() == torch::kInt8, "query must be int8");
@@ -6737,6 +6745,8 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   TORCH_CHECK(!is_causal || q_len == padded_kv_len,
               "native gfx12 causal path currently requires q_len == kv_len");
   TORCH_CHECK((q_heads % kv_heads) == 0, "q_heads must be divisible by kv_heads");
+  TORCH_CHECK(pv_accum_mode >= -1 && pv_accum_mode <= 1,
+              "invalid gfx12 fp16 PV accumulation mode");
   TORCH_CHECK(query_scale.stride(-1) == 1 && key_scale.stride(-1) == 1,
               "scale tensors must have contiguous scale columns");
   const int64_t per_warp_q_groups = ((q_len + 127) / 128) * 4;
@@ -6759,7 +6769,7 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       return qk_int8_sv_f16_d64_native_attn_gfx12_impl<true>(
           query, key, value, output, query_scale, key_scale, tensor_layout,
           is_causal, sm_scale, valid_kv_len, value_scale,
-          value_transposed_hnd_hint);
+          value_transposed_hnd_hint, pv_accum_mode);
     }
   }
   const bool has_value_scale = value_scale.defined() && value_scale.numel() > 0;
@@ -6873,8 +6883,9 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       !value_is_fp8 && is_causal && hnd_contiguous && !value_transposed_hnd &&
       q_len >= 1024;
   const bool use_f16_pv_accum =
-      !value_is_fp8 && is_causal && value_transposed_hnd && block_cols == 64 &&
-      q_len >= 1024;
+      !value_is_fp8 && pv_accum_mode != 0 &&
+      (pv_accum_mode == 1 ||
+       (is_causal && value_transposed_hnd && block_cols == 64 && q_len >= 1024));
   const bool use_f16_pv_ordered_qk =
       use_f16_pv_accum && q_len >= 4096;
   const bool use_f16_vlane =
@@ -7753,7 +7764,7 @@ torch::Tensor qk_int8_sv_f8_scaled_native_attn_gfx12(
     int64_t valid_kv_len) {
   return qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query, key, value, output, query_scale, key_scale, tensor_layout,
-      is_causal, sm_scale, valid_kv_len, value_scale, 1);
+      is_causal, sm_scale, valid_kv_len, value_scale, 1, -1);
 }
 
 torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
@@ -7767,8 +7778,10 @@ torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12(
     int is_causal,
     float sm_scale,
     int64_t valid_kv_len,
-    int value_transposed_hnd) {
+    int value_transposed_hnd,
+    int pv_accum_mode) {
   return qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       query, key, value, output, query_scale, key_scale, tensor_layout,
-      is_causal, sm_scale, valid_kv_len, torch::Tensor(), value_transposed_hnd);
+      is_causal, sm_scale, valid_kv_len, torch::Tensor(), value_transposed_hnd,
+      pv_accum_mode);
 }
