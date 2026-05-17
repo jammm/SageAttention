@@ -34,7 +34,20 @@ torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12(
     int is_causal,
     float sm_scale,
     int64_t valid_kv_len = 0,
-    int value_transposed_hnd = -1);
+    int value_transposed_hnd = -1,
+    int key_hnd_layout = 0);
+
+torch::Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor output,
+    torch::Tensor key_scale,
+    int tensor_layout,
+    int is_causal,
+    float sm_scale,
+    int64_t valid_kv_len = 0,
+    int pv_accum_mode = -1);
 
 torch::Tensor qk_int8_sv_f8_scaled_native_attn_gfx12(
     torch::Tensor query,
@@ -60,7 +73,8 @@ torch::Tensor qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
     int is_causal,
     float sm_scale,
     int64_t valid_kv_len = 0,
-    int value_transposed_hnd = -1);
+    int value_transposed_hnd = -1,
+    int key_hnd_layout = 0);
 
 torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     torch::Tensor query,
@@ -80,6 +94,17 @@ torch::Tensor transpose_value_fp8_hnd_gfx12(torch::Tensor value);
 torch::Tensor transpose_value_fp8_scaled_hnd_gfx12(
     torch::Tensor value,
     torch::Tensor value_scale);
+
+std::vector<torch::Tensor> fp8_value_nhd_short_gfx12(
+    torch::Tensor value,
+    double scale_max);
+
+torch::Tensor mean_nhd_gfx12(torch::Tensor input);
+
+std::vector<torch::Tensor> mean_and_fp8_value_nhd_short_gfx12(
+    torch::Tensor key,
+    torch::Tensor value,
+    double scale_max);
 
 torch::Tensor transpose_value_f16_hnd_gfx12(torch::Tensor value);
 
