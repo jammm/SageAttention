@@ -393,9 +393,7 @@ def sageattn_qk_int8_pv_gfx12_native(
             out = out if out.dtype == torch.bfloat16 else gfx12_native.convert_f16_to_bf16(out)
         return _with_lse(out)
 
-    if tensor_layout == "NHD" and smooth_k and qk_quant_gran == "per_warp" and not (
-        value_dtype == "fp16" and q.size(-1) > 64
-    ):
+    if tensor_layout == "NHD" and smooth_k and qk_quant_gran == "per_warp":
         q_nhd = q.contiguous()
         k_nhd = k.contiguous()
         v_nhd = v.contiguous()
@@ -428,7 +426,6 @@ def sageattn_qk_int8_pv_gfx12_native(
 
         use_short_nhd_fp8_prep = (
             value_dtype == "fp8"
-            and not is_causal
             and input_dtype == torch.float16
             and qo_len == kv_len
             and kv_len in (512, 1024)
@@ -442,6 +439,9 @@ def sageattn_qk_int8_pv_gfx12_native(
                     k_nhd, v_nhd, float(fp8_value_scale_max)
                 )
             )
+            k_mean = k_mean_flat.unsqueeze(1)
+        elif value_dtype == "fp16" and head_dim in (64, 128):
+            k_mean_flat = gfx12_native.mean_nhd(k_nhd)
             k_mean = k_mean_flat.unsqueeze(1)
         else:
             k_mean = k_nhd.mean(dim=1, keepdim=True)
@@ -458,9 +458,13 @@ def sageattn_qk_int8_pv_gfx12_native(
         )
         use_rawq_f16_value = (
             value_dtype == "fp16"
-            and not is_causal
-            and head_dim == 64
+            and input_dtype == torch.float16
+            and head_dim in (64, 128)
             and qk_quant_gran == "per_warp"
+            and (
+                not is_causal
+                or (qo_len == kv_len and qo_len % 64 == 0 and kv_len % 64 == 0)
+            )
         )
         if use_rawq_tail or use_rawq_f16_value:
             q_attn = q_nhd
@@ -525,7 +529,7 @@ def sageattn_qk_int8_pv_gfx12_native(
                 int(use_mixed_key_hnd),
             )
         else:
-            if head_dim == 64 and qk_quant_gran == "per_warp":
+            if use_rawq_f16_value:
                 gfx12_native.qk_rawq_int8_sv_f16_native_attn(
                     q_attn,
                     k_int8,
@@ -598,7 +602,12 @@ def sageattn_qk_int8_pv_gfx12_native(
     if value_dtype == "fp8" and head_dim not in (16, 64, 128):
         raise ValueError("gfx12 fp8 value path currently supports head_dim 16, 64, or 128.")
 
-    k_mean = k_hnd.mean(dim=2, keepdim=True) if smooth_k else None
+    k_mean = None
+    if smooth_k:
+        if value_dtype == "fp16" and qk_quant_gran == "per_warp" and head_dim in (64, 128):
+            k_mean = gfx12_native.mean_hnd(k_hnd).unsqueeze(2)
+        else:
+            k_mean = k_hnd.mean(dim=2, keepdim=True)
     q_hnd, k_hnd, v_hnd = _pad_gfx12_hnd_sequence(
         q_hnd, k_hnd, v_hnd, qo_len, kv_len, bool(is_causal), k_mean)
     padded_qo_len = q_hnd.size(2)
@@ -694,7 +703,24 @@ def sageattn_qk_int8_pv_gfx12_native(
                 out = out.transpose(1, 2).contiguous()
             return _with_lse(out)
 
-        q_int8, q_scale, k_int8, k_scale = _quant_qk_hnd(q_hnd, k_hnd, k_mean)
+        use_smooth_hnd_f16_prep = (
+            value_dtype == "fp16"
+            and qk_quant_gran == "per_warp"
+            and head_dim in (64, 128)
+            and not is_causal
+            and qo_len == kv_len
+            and qo_len in (512, 1024)
+            and q_hnd.dtype == k_hnd.dtype == v_hnd.dtype
+        )
+        value_native = None
+        if use_smooth_hnd_f16_prep:
+            q_int8, q_scale, k_int8, k_scale, value_native = (
+                gfx12_native.prepare_qkv_hnd_smooth_f16(
+                    q_hnd, k_hnd, v_hnd, k_mean.squeeze(2).contiguous()
+                )
+            )
+        else:
+            q_int8, q_scale, k_int8, k_scale = _quant_qk_hnd(q_hnd, k_hnd, k_mean)
         out = torch.empty_like(q_hnd, dtype=torch.float16)
         if value_dtype == "fp8":
             value_native, value_scale = _gfx12_fp8_value_native(
@@ -705,7 +731,8 @@ def sageattn_qk_int8_pv_gfx12_native(
                 1, int(is_causal), float(sm_scale), kv_len
             )
         else:
-            value_native = gfx12_native.transpose_value_f16_hnd(v_hnd)
+            if value_native is None:
+                value_native = gfx12_native.transpose_value_f16_hnd(v_hnd)
             gfx12_native.qk_int8_sv_f16_d64_native_attn(
                 q_int8, k_int8, value_native, out, q_scale, k_scale,
                 1, int(is_causal), float(sm_scale), kv_len, 1,

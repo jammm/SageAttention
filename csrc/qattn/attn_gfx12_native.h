@@ -101,6 +101,14 @@ std::vector<torch::Tensor> fp8_value_nhd_short_gfx12(
 
 torch::Tensor mean_nhd_gfx12(torch::Tensor input);
 
+torch::Tensor mean_hnd_gfx12(torch::Tensor input);
+
+std::vector<torch::Tensor> prepare_qkv_hnd_smooth_f16_gfx12(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor key_mean);
+
 std::vector<torch::Tensor> mean_and_fp8_value_nhd_short_gfx12(
     torch::Tensor key,
     torch::Tensor value,

@@ -596,6 +596,51 @@ __global__ void mean_nhd_kernel(
   }
 }
 
+template <typename T>
+__global__ void mean_hnd_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ mean,
+    const int64_t seq_len,
+    const int64_t heads,
+    const int64_t head_dim) {
+  constexpr int TileD = 16;
+  __shared__ float partial_sum[256];
+
+  const int tid = threadIdx.x;
+  const int d_local = tid & (TileD - 1);
+  const int s_lane = tid >> 4;
+  const int64_t d_base = static_cast<int64_t>(blockIdx.x) * TileD;
+  const int64_t h = blockIdx.y;
+  const int64_t b = blockIdx.z;
+  const int64_t d = d_base + d_local;
+
+  float local_sum = 0.0f;
+  if (d < head_dim) {
+    for (int64_t s = s_lane; s < seq_len; s += 16) {
+      const int64_t offset = ((b * heads + h) * seq_len + s) * head_dim + d;
+      local_sum += value_to_float(input[offset]);
+    }
+  }
+  partial_sum[tid] = local_sum;
+  __syncthreads();
+
+  if (tid < TileD) {
+    float sum = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+      sum += partial_sum[i * TileD + tid];
+    }
+    const int64_t mean_d = d_base + tid;
+    if (mean_d < head_dim) {
+      const float value = sum / static_cast<float>(seq_len);
+      if constexpr (std::is_same<T, __half>::value) {
+        mean[(b * heads + h) * head_dim + mean_d] = value_from_float_half(value);
+      } else {
+        mean[(b * heads + h) * head_dim + mean_d] = value_from_float_bfloat16(value);
+      }
+    }
+  }
+}
+
 __device__ __forceinline__ int32_t pack_f32x4_to_ocp_fp8(
     const float x0,
     const float x1,
@@ -3452,8 +3497,8 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
   static_assert(ValueTiles == 1 || ValueTiles == 4 || ValueTiles == 8,
                 "native fp8 2q stores one D16, D64, or D128 value slice per launch.");
   static_assert(ValueTileBase + ValueTiles <= DTiles, "invalid fp8 value tile slice.");
-  static_assert(!NoQueryTail || (StaticNhdLayout && !IsCausal),
-                "full-query fp8 path requires a static non-causal dispatch.");
+  static_assert(!NoQueryTail || StaticNhdLayout,
+                "full-query fp8 path requires a static dispatch.");
 
   __shared__ int8_t k_tile[UsePrepackedLaneMajorK ? 1 : BC][SharedHeadStride];
   __shared__ uint8_t v_tile[UsePrepackedLaneMajorValue ? 1 : SharedValueRows]
@@ -4593,11 +4638,13 @@ template <typename T,
           bool PrepackFp8Lane = false,
           bool FullGroupsNoTail = false,
           int StaticQLen = 0,
-          int StaticKvLen = 0>
+          int StaticKvLen = 0,
+          bool SubtractKeyMean = false>
 __global__ void prepare_qkv_hnd_kernel(
     const T* __restrict__ query,
     const T* __restrict__ key,
     const T* __restrict__ value,
+    const T* __restrict__ key_mean,
     int8_t* __restrict__ query_out,
     int8_t* __restrict__ key_out,
     float* __restrict__ query_scale,
@@ -4628,6 +4675,8 @@ __global__ void prepare_qkv_hnd_kernel(
                 "static QKV preparation Q length must cover full two-group Q tasks.");
   static_assert(StaticKvLen == 0 || (StaticKvLen % KRows) == 0,
                 "static QKV preparation KV length must cover full K groups.");
+  static_assert(!SubtractKeyMean || !PrepackF16KLane,
+                "smooth-K preparation does not use lane-major K prepack.");
 
   __shared__ float shared_amax[2];
   __shared__ float shared_pair_amax[2][32];
@@ -4735,14 +4784,25 @@ __global__ void prepare_qkv_hnd_kernel(
         const T* values = reinterpret_cast<const T*>(&raw);
         char4 out0;
         char4 out1;
-        out0.x = float_to_int8_rn_gfx12(value_to_float(values[0]) * inv_scale0);
-        out0.y = float_to_int8_rn_gfx12(value_to_float(values[1]) * inv_scale0);
-        out0.z = float_to_int8_rn_gfx12(value_to_float(values[2]) * inv_scale0);
-        out0.w = float_to_int8_rn_gfx12(value_to_float(values[3]) * inv_scale0);
-        out1.x = float_to_int8_rn_gfx12(value_to_float(values[4]) * inv_scale0);
-        out1.y = float_to_int8_rn_gfx12(value_to_float(values[5]) * inv_scale0);
-        out1.z = float_to_int8_rn_gfx12(value_to_float(values[6]) * inv_scale0);
-        out1.w = float_to_int8_rn_gfx12(value_to_float(values[7]) * inv_scale0);
+        if constexpr (SubtractKeyMean) {
+          out0.x = float_to_int8_nearby_gfx12(value_to_float(values[0]) * inv_scale0);
+          out0.y = float_to_int8_nearby_gfx12(value_to_float(values[1]) * inv_scale0);
+          out0.z = float_to_int8_nearby_gfx12(value_to_float(values[2]) * inv_scale0);
+          out0.w = float_to_int8_nearby_gfx12(value_to_float(values[3]) * inv_scale0);
+          out1.x = float_to_int8_nearby_gfx12(value_to_float(values[4]) * inv_scale0);
+          out1.y = float_to_int8_nearby_gfx12(value_to_float(values[5]) * inv_scale0);
+          out1.z = float_to_int8_nearby_gfx12(value_to_float(values[6]) * inv_scale0);
+          out1.w = float_to_int8_nearby_gfx12(value_to_float(values[7]) * inv_scale0);
+        } else {
+          out0.x = float_to_int8_rn_gfx12(value_to_float(values[0]) * inv_scale0);
+          out0.y = float_to_int8_rn_gfx12(value_to_float(values[1]) * inv_scale0);
+          out0.z = float_to_int8_rn_gfx12(value_to_float(values[2]) * inv_scale0);
+          out0.w = float_to_int8_rn_gfx12(value_to_float(values[3]) * inv_scale0);
+          out1.x = float_to_int8_rn_gfx12(value_to_float(values[4]) * inv_scale0);
+          out1.y = float_to_int8_rn_gfx12(value_to_float(values[5]) * inv_scale0);
+          out1.z = float_to_int8_rn_gfx12(value_to_float(values[6]) * inv_scale0);
+          out1.w = float_to_int8_rn_gfx12(value_to_float(values[7]) * inv_scale0);
+        }
         *reinterpret_cast<char4*>(query_out + off) = out0;
         *reinterpret_cast<char4*>(query_out + off + 4) = out1;
       }
@@ -4756,14 +4816,25 @@ __global__ void prepare_qkv_hnd_kernel(
           const T* values = reinterpret_cast<const T*>(&raw);
           char4 out0;
           char4 out1;
-          out0.x = float_to_int8_rn_gfx12(value_to_float(values[0]) * inv_scale1);
-          out0.y = float_to_int8_rn_gfx12(value_to_float(values[1]) * inv_scale1);
-          out0.z = float_to_int8_rn_gfx12(value_to_float(values[2]) * inv_scale1);
-          out0.w = float_to_int8_rn_gfx12(value_to_float(values[3]) * inv_scale1);
-          out1.x = float_to_int8_rn_gfx12(value_to_float(values[4]) * inv_scale1);
-          out1.y = float_to_int8_rn_gfx12(value_to_float(values[5]) * inv_scale1);
-          out1.z = float_to_int8_rn_gfx12(value_to_float(values[6]) * inv_scale1);
-          out1.w = float_to_int8_rn_gfx12(value_to_float(values[7]) * inv_scale1);
+          if constexpr (SubtractKeyMean) {
+            out0.x = float_to_int8_nearby_gfx12(value_to_float(values[0]) * inv_scale1);
+            out0.y = float_to_int8_nearby_gfx12(value_to_float(values[1]) * inv_scale1);
+            out0.z = float_to_int8_nearby_gfx12(value_to_float(values[2]) * inv_scale1);
+            out0.w = float_to_int8_nearby_gfx12(value_to_float(values[3]) * inv_scale1);
+            out1.x = float_to_int8_nearby_gfx12(value_to_float(values[4]) * inv_scale1);
+            out1.y = float_to_int8_nearby_gfx12(value_to_float(values[5]) * inv_scale1);
+            out1.z = float_to_int8_nearby_gfx12(value_to_float(values[6]) * inv_scale1);
+            out1.w = float_to_int8_nearby_gfx12(value_to_float(values[7]) * inv_scale1);
+          } else {
+            out0.x = float_to_int8_rn_gfx12(value_to_float(values[0]) * inv_scale1);
+            out0.y = float_to_int8_rn_gfx12(value_to_float(values[1]) * inv_scale1);
+            out0.z = float_to_int8_rn_gfx12(value_to_float(values[2]) * inv_scale1);
+            out0.w = float_to_int8_rn_gfx12(value_to_float(values[3]) * inv_scale1);
+            out1.x = float_to_int8_rn_gfx12(value_to_float(values[4]) * inv_scale1);
+            out1.y = float_to_int8_rn_gfx12(value_to_float(values[5]) * inv_scale1);
+            out1.z = float_to_int8_rn_gfx12(value_to_float(values[6]) * inv_scale1);
+            out1.w = float_to_int8_rn_gfx12(value_to_float(values[7]) * inv_scale1);
+          }
           *reinterpret_cast<char4*>(query_out + off) = out0;
           *reinterpret_cast<char4*>(query_out + off + 4) = out1;
         }
@@ -4796,9 +4867,17 @@ __global__ void prepare_qkv_hnd_kernel(
               HeadDim + d;
       const uint4 raw = *reinterpret_cast<const uint4*>(key + off);
       const T* values = reinterpret_cast<const T*>(&raw);
+      const T* mean_values = nullptr;
+      if constexpr (SubtractKeyMean) {
+        mean_values = key_mean + (static_cast<int64_t>(b) * kv_heads + head) * HeadDim + d;
+      }
 #pragma unroll
       for (int i = 0; i < PackElems; ++i) {
-        local_amax = fmaxf(local_amax, fabsf(value_to_float(values[i])));
+        float value = value_to_float(values[i]);
+        if constexpr (SubtractKeyMean) {
+          value -= value_to_float(mean_values[i]);
+        }
+        local_amax = fmaxf(local_amax, fabsf(value));
       }
     }
   }
@@ -4824,16 +4903,49 @@ __global__ void prepare_qkv_hnd_kernel(
       const uint4 raw_v = *reinterpret_cast<const uint4*>(value + off);
       const T* k_values = reinterpret_cast<const T*>(&raw_k);
       const T* v_values = reinterpret_cast<const T*>(&raw_v);
+      const T* mean_values = nullptr;
+      if constexpr (SubtractKeyMean) {
+        mean_values = key_mean + (static_cast<int64_t>(b) * kv_heads + head) * HeadDim + d;
+      }
       char4 out0;
       char4 out1;
-      out0.x = float_to_int8_rn_gfx12(value_to_float(k_values[0]) * inv_scale);
-      out0.y = float_to_int8_rn_gfx12(value_to_float(k_values[1]) * inv_scale);
-      out0.z = float_to_int8_rn_gfx12(value_to_float(k_values[2]) * inv_scale);
-      out0.w = float_to_int8_rn_gfx12(value_to_float(k_values[3]) * inv_scale);
-      out1.x = float_to_int8_rn_gfx12(value_to_float(k_values[4]) * inv_scale);
-      out1.y = float_to_int8_rn_gfx12(value_to_float(k_values[5]) * inv_scale);
-      out1.z = float_to_int8_rn_gfx12(value_to_float(k_values[6]) * inv_scale);
-      out1.w = float_to_int8_rn_gfx12(value_to_float(k_values[7]) * inv_scale);
+      float k0 = value_to_float(k_values[0]);
+      float k1 = value_to_float(k_values[1]);
+      float k2 = value_to_float(k_values[2]);
+      float k3 = value_to_float(k_values[3]);
+      float k4 = value_to_float(k_values[4]);
+      float k5 = value_to_float(k_values[5]);
+      float k6 = value_to_float(k_values[6]);
+      float k7 = value_to_float(k_values[7]);
+      if constexpr (SubtractKeyMean) {
+        k0 -= value_to_float(mean_values[0]);
+        k1 -= value_to_float(mean_values[1]);
+        k2 -= value_to_float(mean_values[2]);
+        k3 -= value_to_float(mean_values[3]);
+        k4 -= value_to_float(mean_values[4]);
+        k5 -= value_to_float(mean_values[5]);
+        k6 -= value_to_float(mean_values[6]);
+        k7 -= value_to_float(mean_values[7]);
+      }
+      if constexpr (SubtractKeyMean) {
+        out0.x = float_to_int8_nearby_gfx12(k0 * inv_scale);
+        out0.y = float_to_int8_nearby_gfx12(k1 * inv_scale);
+        out0.z = float_to_int8_nearby_gfx12(k2 * inv_scale);
+        out0.w = float_to_int8_nearby_gfx12(k3 * inv_scale);
+        out1.x = float_to_int8_nearby_gfx12(k4 * inv_scale);
+        out1.y = float_to_int8_nearby_gfx12(k5 * inv_scale);
+        out1.z = float_to_int8_nearby_gfx12(k6 * inv_scale);
+        out1.w = float_to_int8_nearby_gfx12(k7 * inv_scale);
+      } else {
+        out0.x = float_to_int8_rn_gfx12(k0 * inv_scale);
+        out0.y = float_to_int8_rn_gfx12(k1 * inv_scale);
+        out0.z = float_to_int8_rn_gfx12(k2 * inv_scale);
+        out0.w = float_to_int8_rn_gfx12(k3 * inv_scale);
+        out1.x = float_to_int8_rn_gfx12(k4 * inv_scale);
+        out1.y = float_to_int8_rn_gfx12(k5 * inv_scale);
+        out1.z = float_to_int8_rn_gfx12(k6 * inv_scale);
+        out1.w = float_to_int8_rn_gfx12(k7 * inv_scale);
+      }
       if constexpr (PrepackFp8Lane) {
         const int row_in_group = row & 63;
         const int col_tile = row_in_group >> 4;
@@ -5549,6 +5661,37 @@ torch::Tensor mean_nhd_gfx12(torch::Tensor input) {
   return mean;
 }
 
+torch::Tensor mean_hnd_gfx12(torch::Tensor input) {
+  TORCH_CHECK(input.is_cuda(), "gfx12 HND mean expects a CUDA/HIP tensor");
+  TORCH_CHECK(input.dim() == 4, "gfx12 HND mean expects [B, H, S, D]");
+  TORCH_CHECK(input.is_contiguous(), "gfx12 HND mean expects contiguous HND input");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat16 || input.scalar_type() == torch::kBFloat16,
+              "gfx12 HND mean supports fp16/bf16 input");
+
+  const int64_t batch = input.size(0);
+  const int64_t heads = input.size(1);
+  const int64_t seq_len = input.size(2);
+  const int64_t head_dim = input.size(3);
+  torch::Tensor mean = torch::empty({batch, heads, head_dim}, input.options());
+
+  dim3 block(256);
+  dim3 grid((head_dim + 15) / 16, heads, batch);
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (input.scalar_type() == torch::kFloat16) {
+    mean_hnd_kernel<__half><<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __half*>(input.data_ptr<at::Half>()),
+        reinterpret_cast<__half*>(mean.data_ptr<at::Half>()),
+        seq_len, heads, head_dim);
+  } else {
+    mean_hnd_kernel<__hip_bfloat16><<<grid, block, 0, stream>>>(
+        reinterpret_cast<const __hip_bfloat16*>(input.data_ptr<at::BFloat16>()),
+        reinterpret_cast<__hip_bfloat16*>(mean.data_ptr<at::BFloat16>()),
+        seq_len, heads, head_dim);
+  }
+  hip_kernel_launch_check();
+  return mean;
+}
+
 std::vector<torch::Tensor> mean_and_fp8_value_nhd_short_gfx12(
     torch::Tensor key,
     torch::Tensor value,
@@ -5696,6 +5839,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
+                         nullptr,
                          query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
                          query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
                          reinterpret_cast<OutT*>(value_out.data_ptr()),
@@ -5706,6 +5850,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
+                         nullptr,
                          query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
                          query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
                          reinterpret_cast<OutT*>(value_out.data_ptr()),
@@ -5719,6 +5864,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
                            reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
+                           nullptr,
                            query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
                            query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
                            reinterpret_cast<OutT*>(value_out.data_ptr()),
@@ -5729,6 +5875,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
                            reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
+                           nullptr,
                            query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
                            query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
                            reinterpret_cast<OutT*>(value_out.data_ptr()),
@@ -5742,6 +5889,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
+                         nullptr,
                          query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
                          query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
                          reinterpret_cast<OutT*>(value_out.data_ptr()),
@@ -5752,6 +5900,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
+                         nullptr,
                          query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
                          query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
                          reinterpret_cast<OutT*>(value_out.data_ptr()),
@@ -5765,6 +5914,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
                            reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
+                           nullptr,
                            query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
                            query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
                            reinterpret_cast<OutT*>(value_out.data_ptr()),
@@ -5775,12 +5925,135 @@ std::vector<torch::Tensor> prepare_qkv_hnd_gfx12(
                            reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
+                           nullptr,
                            query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
                            query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
                            reinterpret_cast<OutT*>(value_out.data_ptr()),
                            batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                            fuse_self_qkv);
       }
+    }
+  }
+  hip_kernel_launch_check();
+  return {query_out, query_scale, key_out, key_scale, value_out};
+}
+
+std::vector<torch::Tensor> prepare_qkv_hnd_smooth_f16_gfx12(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor key_mean) {
+  TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda() && key_mean.is_cuda(),
+              "smooth gfx12 QKV preparation expects CUDA/HIP tensors");
+  TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4,
+              "smooth gfx12 QKV preparation expects [B, H, S, D]");
+  TORCH_CHECK(key_mean.dim() == 3,
+              "smooth gfx12 QKV preparation expects key_mean [B, H, D]");
+  TORCH_CHECK(query.is_contiguous() && key.is_contiguous() && value.is_contiguous() &&
+                  key_mean.is_contiguous(),
+              "smooth gfx12 QKV preparation expects contiguous HND tensors");
+  TORCH_CHECK(query.scalar_type() == key.scalar_type() &&
+                  query.scalar_type() == value.scalar_type() &&
+                  query.scalar_type() == key_mean.scalar_type(),
+              "smooth gfx12 QKV preparation expects matching input dtypes");
+  TORCH_CHECK(query.scalar_type() == torch::kFloat16 || query.scalar_type() == torch::kBFloat16,
+              "smooth gfx12 QKV preparation supports fp16/bf16 input");
+  TORCH_CHECK(query.size(0) == key.size(0) && query.size(0) == value.size(0) &&
+                  query.size(0) == key_mean.size(0),
+              "Q/K/V batch size mismatch");
+  TORCH_CHECK(query.size(3) == key.size(3) && query.size(3) == value.size(3) &&
+                  query.size(3) == key_mean.size(2),
+              "Q/K/V head_dim mismatch");
+  TORCH_CHECK(key.size(1) == value.size(1) && key.size(2) == value.size(2) &&
+                  key.size(1) == key_mean.size(1),
+              "K/V shape mismatch");
+
+  const int64_t batch = query.size(0);
+  const int64_t q_heads = query.size(1);
+  const int64_t q_len = query.size(2);
+  const int64_t kv_heads = key.size(1);
+  const int64_t kv_len = key.size(2);
+  const int64_t head_dim = query.size(3);
+  TORCH_CHECK(head_dim == 64 || head_dim == 128,
+              "smooth gfx12 QKV preparation supports head_dim 64 or 128");
+  TORCH_CHECK((q_len % 64) == 0 && (kv_len % 64) == 0,
+              "smooth gfx12 QKV preparation requires sequence lengths divisible by 64");
+
+  const int q_groups = static_cast<int>((q_len + 31) / 32);
+  const int q_task_groups = (q_groups + 1) / 2;
+  const int k_groups = static_cast<int>((kv_len + 63) / 64);
+  const bool fuse_self_qkv =
+      q_heads == kv_heads && q_len == kv_len && q_task_groups == k_groups;
+  torch::Tensor query_out = torch::empty_like(query, query.options().dtype(torch::kInt8));
+  torch::Tensor key_out = torch::empty_like(key, key.options().dtype(torch::kInt8));
+  torch::Tensor query_scale =
+      torch::empty({batch, q_heads, q_groups}, query.options().dtype(torch::kFloat32));
+  torch::Tensor key_scale =
+      torch::empty({batch, kv_heads, k_groups}, key.options().dtype(torch::kFloat32));
+  torch::Tensor value_out =
+      torch::empty({batch, kv_heads, head_dim, kv_len}, value.options().dtype(torch::kFloat16));
+
+  constexpr int D64PrepThreads = 256;
+  const dim3 block(head_dim == 64 ? D64PrepThreads : 256);
+  const dim3 grid(fuse_self_qkv ? k_groups : (q_task_groups + k_groups),
+                  std::max(q_heads, kv_heads),
+                  batch);
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (query.scalar_type() == torch::kFloat16) {
+    if (head_dim == 64) {
+      prepare_qkv_hnd_kernel<__half, __half, false, 64, D64PrepThreads,
+                             true, true, false, false, false, false, 0, 0, true>
+          <<<grid, block, 0, stream>>>(
+              reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
+              reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
+              reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
+              reinterpret_cast<const __half*>(key_mean.data_ptr<at::Half>()),
+              query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
+              query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
+              reinterpret_cast<__half*>(value_out.data_ptr<at::Half>()),
+              batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+              fuse_self_qkv);
+    } else {
+      prepare_qkv_hnd_kernel<__half, __half, false, 128, 256,
+                             true, true, false, false, false, false, 0, 0, true>
+          <<<grid, block, 0, stream>>>(
+              reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
+              reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
+              reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
+              reinterpret_cast<const __half*>(key_mean.data_ptr<at::Half>()),
+              query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
+              query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
+              reinterpret_cast<__half*>(value_out.data_ptr<at::Half>()),
+              batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+              fuse_self_qkv);
+    }
+  } else {
+    if (head_dim == 64) {
+      prepare_qkv_hnd_kernel<__hip_bfloat16, __half, false, 64, D64PrepThreads,
+                             true, true, false, false, false, false, 0, 0, true>
+          <<<grid, block, 0, stream>>>(
+              reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const __hip_bfloat16*>(key_mean.data_ptr<at::BFloat16>()),
+              query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
+              query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
+              reinterpret_cast<__half*>(value_out.data_ptr<at::Half>()),
+              batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+              fuse_self_qkv);
+    } else {
+      prepare_qkv_hnd_kernel<__hip_bfloat16, __half, false, 128, 256,
+                             true, true, false, false, false, false, 0, 0, true>
+          <<<grid, block, 0, stream>>>(
+              reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
+              reinterpret_cast<const __hip_bfloat16*>(key_mean.data_ptr<at::BFloat16>()),
+              query_out.data_ptr<int8_t>(), key_out.data_ptr<int8_t>(),
+              query_scale.data_ptr<float>(), key_scale.data_ptr<float>(),
+              reinterpret_cast<__half*>(value_out.data_ptr<at::Half>()),
+              batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
+              fuse_self_qkv);
     }
   }
   hip_kernel_launch_check();
@@ -5895,6 +6168,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_packed_gfx12(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
+                         nullptr,
                          query_ptr, key_ptr, scale_ptr, scale_ptr + q_scale_numel,
                          value_ptr,
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
@@ -5904,6 +6178,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_packed_gfx12(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
+                         nullptr,
                          query_ptr, key_ptr, scale_ptr, scale_ptr + q_scale_numel,
                          value_ptr,
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
@@ -5913,6 +6188,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_packed_gfx12(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
+                         nullptr,
                          query_ptr, key_ptr, scale_ptr, scale_ptr + q_scale_numel,
                          value_ptr,
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
@@ -5924,6 +6200,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_packed_gfx12(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
+                         nullptr,
                          query_ptr, key_ptr, scale_ptr, scale_ptr + q_scale_numel,
                          value_ptr,
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
@@ -5933,6 +6210,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_packed_gfx12(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
+                         nullptr,
                          query_ptr, key_ptr, scale_ptr, scale_ptr + q_scale_numel,
                          value_ptr,
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
@@ -5942,6 +6220,7 @@ std::vector<torch::Tensor> prepare_qkv_hnd_packed_gfx12(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
+                         nullptr,
                          query_ptr, key_ptr, scale_ptr, scale_ptr + q_scale_numel,
                          value_ptr,
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
@@ -6070,7 +6349,7 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
                          reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                          reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
-                         nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
+                         nullptr, nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                          false);
     } else if (head_dim == 64) {
@@ -6102,7 +6381,7 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
                            reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
-                           nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
+                           nullptr, nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
                            batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                            false);
       }
@@ -6135,7 +6414,7 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
                            reinterpret_cast<const __half*>(query.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
                            reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
-                           nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
+                           nullptr, nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
                            batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                            false);
       }
@@ -6146,7 +6425,7 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
                          reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                          reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
-                         nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
+                         nullptr, nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
                          batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                          false);
     } else if (head_dim == 64) {
@@ -6178,7 +6457,7 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
                            reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
-                           nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
+                           nullptr, nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
                            batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                            false);
       }
@@ -6211,7 +6490,7 @@ std::vector<torch::Tensor> prepare_kv_hnd_packed_gfx12(
                            reinterpret_cast<const __hip_bfloat16*>(query.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(key.data_ptr<at::BFloat16>()),
                            reinterpret_cast<const __hip_bfloat16*>(value.data_ptr<at::BFloat16>()),
-                           nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
+                           nullptr, nullptr, key_ptr, nullptr, key_scale_ptr, value_ptr,
                            batch, q_heads, kv_heads, q_len, kv_len, q_groups, k_groups,
                            false);
       }
@@ -7368,6 +7647,9 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
   const bool use_f16_streamk =
       head_dim == 64 && !value_is_fp8 && is_causal && value_transposed_hnd &&
       q_len == 4096 && block_rows == 256;
+  const bool use_f16_d128_short_stream =
+      head_dim == 128 && !value_is_fp8 && is_causal && block_cols == 64 &&
+      block_rows == 128 && q_len <= 1024;
   if constexpr (PerThreadQK) {
     TORCH_CHECK(value_transposed_hnd,
                 "gfx12 per-thread QK path expects transposed HND values");
@@ -7551,9 +7833,14 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
       tensor_layout, sm_scale, use_per_thread_qk)
 #define SAGEATTN_LAUNCH_F16_D128_2Q_TV(BC_, BR_, PAD_) \
   if (is_causal) { \
-    SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID_HD(128, BC_, BR_, PAD_, false, false, false, false, false, grid, false); \
+    if (use_f16_d128_short_stream) { \
+      SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID_HD(128, BC_, BR_, PAD_, false, false, false, true, false, grid, false); \
+    } else { \
+      SAGEATTN_LAUNCH_F16_2Q_TV_CAUSAL_GRID_HD(128, BC_, BR_, PAD_, false, false, false, false, false, grid, false); \
+    } \
   } else { \
-    qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, false, false, false, int8_t, false, int8_t, false, false, false, false, false, 128><<<grid, block, 0, stream>>>( \
+    if (use_f16_d128_short_stream) { \
+      qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, false, false, false, int8_t, false, int8_t, false, false, false, true, false, 128><<<grid, block, 0, stream>>>( \
         query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
         reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
         reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -7566,6 +7853,21 @@ static torch::Tensor qk_int8_sv_f16_d64_native_attn_gfx12_impl(
         query_scale.stride(0), query_scale.stride(1), \
         key_scale.stride(0), key_scale.stride(1), \
         tensor_layout, sm_scale, use_per_thread_qk); \
+    } else { \
+      qk_int8_sv_f16_d64_native_2q_kernel<BC_, true, BR_, true, PAD_, false, false, false, int8_t, false, int8_t, false, false, false, false, false, 128><<<grid, block, 0, stream>>>( \
+        query.data_ptr<int8_t>(), key.data_ptr<int8_t>(), \
+        reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
+        reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
+        query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), \
+        batch, q_len, kv_len, q_heads, kv_heads, \
+        query.stride(0), query.stride(tensor_layout == kNHD ? 1 : 2), query.stride(tensor_layout == kNHD ? 2 : 1), \
+        key.stride(0), key.stride(tensor_layout == kNHD ? 1 : 2), key.stride(tensor_layout == kNHD ? 2 : 1), \
+        value.stride(0), value.stride(2), value.stride(1), \
+        output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
+        query_scale.stride(0), query_scale.stride(1), \
+        key_scale.stride(0), key_scale.stride(1), \
+        tensor_layout, sm_scale, use_per_thread_qk); \
+    } \
   }
 #define SAGEATTN_LAUNCH_F16_2Q_TV(BC_, BR_, PAD_) \
   if (is_causal) { \
@@ -8274,9 +8576,29 @@ static torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
       !key_hnd_contiguous && q_heads == kv_heads && q_len == kv_len &&
       q_len == 512 && head_dim == 128 &&
       query.scalar_type() == torch::kFloat16 && output.scalar_type() == torch::kFloat16;
+  const bool use_static_causal_nhd =
+      is_causal && value_transposed_hnd && tensor_layout == kNHD &&
+      !key_hnd_contiguous && q_heads == kv_heads && q_len == kv_len &&
+      block_rows == 128 && (q_len % block_rows) == 0 &&
+      (head_dim == 128 || (head_dim == 64 && q_len >= 1024)) &&
+      query.scalar_type() == torch::kFloat16 && output.scalar_type() == torch::kFloat16;
+  const bool use_bc32_causal_short_nhd =
+      use_static_causal_nhd && head_dim == 128 && q_len <= 1024;
 
   if (use_static_short_nhd) {
     SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX(64, 128, false, false, 128, true, false,
+                                      __half, __half, at::Half, at::Half,
+                                      true, true, true, true);
+  } else if (use_static_causal_nhd && head_dim == 64) {
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX(64, 64, false, false, 128, true, true,
+                                      __half, __half, at::Half, at::Half,
+                                      true, true, true, true);
+  } else if (use_bc32_causal_short_nhd) {
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX(32, 128, false, false, 128, true, true,
+                                      __half, __half, at::Half, at::Half,
+                                      true, true, true, true);
+  } else if (use_static_causal_nhd) {
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX(64, 128, false, false, 128, true, true,
                                       __half, __half, at::Half, at::Half,
                                       true, true, true, true);
   } else if (use_bc32) {
@@ -8435,9 +8757,11 @@ torch::Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
   const dim3 block(block_rows);
   const dim3 grid((q_len + block_rows - 1) / block_rows, q_heads, batch);
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  const bool use_d128_short_stream =
+      is_causal && head_dim == 128 && block_rows == 128 && q_len <= 1024;
 
-#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_) \
-  qk_int8_sv_f16_d64_native_2q_kernel<64, HND_, BR_, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD, CAUSAL_, false, F16ACC_, QUERY_T_, true, int8_t, false, false, false, false, false, HD_><<<grid, block, 0, stream>>>( \
+#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_) \
+  qk_int8_sv_f16_d64_native_2q_kernel<64, HND_, BR_, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD, CAUSAL_, false, F16ACC_, QUERY_T_, true, int8_t, false, false, false, STREAM_, false, HD_><<<grid, block, 0, stream>>>( \
       reinterpret_cast<const QUERY_T_*>(query.data_ptr()), key.data_ptr<int8_t>(), \
       reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
       reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -8452,18 +8776,20 @@ torch::Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
 #define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(HD_, HND_, QUERY_T_) \
   if (is_causal) { \
     if (pv_accum_mode == 1) { \
-      if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, true, QUERY_T_, true); } \
-      else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, true, QUERY_T_, true); } \
+      if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, true, QUERY_T_, true, false); } \
+      else if ((HD_) == 128 && use_d128_short_stream) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, true, QUERY_T_, true, true); } \
+      else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, true, QUERY_T_, true, false); } \
     } else { \
-      if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, true, QUERY_T_, false); } \
-      else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, true, QUERY_T_, false); } \
+      if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, true, QUERY_T_, false, false); } \
+      else if ((HD_) == 128 && use_d128_short_stream) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, true, QUERY_T_, false, true); } \
+      else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, true, QUERY_T_, false, false); } \
     } \
   } else if (pv_accum_mode == 1) { \
-    if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, false, QUERY_T_, true); } \
-    else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, false, QUERY_T_, true); } \
+    if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, false, QUERY_T_, true, false); } \
+    else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, false, QUERY_T_, true, false); } \
   } else { \
-    if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, false, QUERY_T_, false); } \
-    else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, false, QUERY_T_, false); } \
+    if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, false, QUERY_T_, false, false); } \
+    else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, false, QUERY_T_, false, false); } \
   }
 #define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_DTYPE(QUERY_T_) \
   if (hnd_contiguous) { \

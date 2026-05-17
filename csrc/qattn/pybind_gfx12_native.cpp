@@ -48,6 +48,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("fp8_value_nhd_short", &fp8_value_nhd_short_gfx12,
         py::arg("value"), py::arg("scale_max"));
   m.def("mean_nhd", &mean_nhd_gfx12);
+  m.def("mean_hnd", &mean_hnd_gfx12);
+  m.def("prepare_qkv_hnd_smooth_f16", &prepare_qkv_hnd_smooth_f16_gfx12,
+        py::arg("query"), py::arg("key"), py::arg("value"), py::arg("key_mean"));
   m.def("mean_and_fp8_value_nhd_short", &mean_and_fp8_value_nhd_short_gfx12,
         py::arg("key"), py::arg("value"), py::arg("scale_max"));
   m.def("transpose_value_f16_hnd", &transpose_value_f16_hnd_gfx12);
