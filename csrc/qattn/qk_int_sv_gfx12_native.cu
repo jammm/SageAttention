@@ -2230,7 +2230,11 @@ template <int BlockCols,
           bool LaneMajorKey = false,
           int HeadDim = 64,
           bool FlatCausalSchedule = false,
-          bool PerThreadQK = false>
+          bool PerThreadQK = false,
+          bool StaticNhdLayout = false,
+          bool NoKvTail = false,
+          bool SameQKHeads = false,
+          bool NoQueryTail = false>
 SAGEATTN_NATIVE_2Q_WAVES_PER_EU(HeadDim, IsCausal) __global__
 SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2q_kernel(
     const QueryT* __restrict__ q,
@@ -2310,6 +2314,8 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                 "lane-major fp16 key staging requires prepared HND BC64 PvOrderedQK.");
   static_assert(!StreamColTiles || (BlockCols <= 128 && (QuantizeQuery || HndContiguous)),
                 "streaming col-tile softmax is specialized for raw/quantized QK.");
+  static_assert(!NoQueryTail || StaticNhdLayout,
+                "full-query fp16 path requires a static dispatch.");
   __shared__ int8_t k_tile[UseLaneMajorKey ? 1 : BC]
                         [SharedQKHeadStride];
   __shared__ uint2 k_lane_tile[UseLaneMajorKey ? (ColTiles * DTiles * 32) : 1];
@@ -2322,7 +2328,6 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
   const int wave = tid >> 5;
   const int row_base = (lane >> 4) << 3;
   const int col = lane & 15;
-  const int64_t q_block_count = (qo_len + BR - 1) / BR;
   const int64_t hb_count = num_qo_heads * batch_size;
   for (;;) {
     int64_t q_block = static_cast<int64_t>(blockIdx.x);
@@ -2340,11 +2345,9 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
       return;
     }
 
-    const int64_t hkv = hq / (num_qo_heads / num_kv_heads);
-    const int64_t q_head_base = b * q_stride_b + hq * q_stride_h;
+    const int64_t hkv = SameQKHeads ? hq : hq / (num_qo_heads / num_kv_heads);
     const int64_t k_head_base = b * k_stride_b + hkv * k_stride_h;
     const int64_t v_head_base = b * v_stride_b + hkv * v_stride_h;
-    const int64_t o_head_base = b * o_stride_b + hq * o_stride_h;
     int64_t q_start[QGroups];
     float qs[QGroups];
 #pragma unroll
@@ -2368,8 +2371,17 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
       const int row = elem_base / HeadDim;
       const int d = elem_base - row * HeadDim;
       const int64_t q_idx = q_base + local_q_row_base + row;
-      if (q_idx < qo_len) {
-        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+      if constexpr (NoQueryTail) {
+        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
+            tensor_layout, b, hq, q_idx, d, q_stride_b, q_stride_n, q_stride_h);
+        const uint4 raw = *reinterpret_cast<const uint4*>(q + q_off);
+        const QueryT* values = reinterpret_cast<const QueryT*>(&raw);
+#pragma unroll
+        for (int i = 0; i < QPackElems; ++i) {
+          local_q_amax = fmaxf(local_q_amax, fabsf(value_to_float(values[i])));
+        }
+      } else if (q_idx < qo_len) {
+        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
             tensor_layout, b, hq, q_idx, d, q_stride_b, q_stride_n, q_stride_h);
         const uint4 raw = *reinterpret_cast<const uint4*>(q + q_off);
         const QueryT* values = reinterpret_cast<const QueryT*>(&raw);
@@ -2388,7 +2400,8 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
       const int64_t qg_start = q_start[qg];
 #pragma unroll
       for (int dt = 0; dt < DTiles; ++dt) {
-        q_regs[qg][dt] = pack_quant_q_i8_wmma_b_regs<QueryT, HeadDim, HndContiguous>(
+        q_regs[qg][dt] =
+            pack_quant_q_i8_wmma_b_regs<QueryT, HeadDim, HndContiguous, StaticNhdLayout, NoQueryTail>(
             q, tensor_layout, lane, b, hq, qg_start, qo_len, dt * BK,
             q_stride_b, q_stride_n, q_stride_h, inv_q_scale);
       }
@@ -2409,7 +2422,8 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
       for (int qg = 0; qg < QGroups; ++qg) {
 #pragma unroll
         for (int dt = 0; dt < DTiles; ++dt) {
-          q_regs[qg][dt] = pack_q_i8_wmma_b_regs<HeadDim, HndContiguous>(
+          q_regs[qg][dt] =
+              pack_q_i8_wmma_b_regs<HeadDim, HndContiguous, StaticNhdLayout, NoQueryTail>(
               reinterpret_cast<const int8_t*>(q), tensor_layout, lane, b, hq, q_start[qg],
               qo_len, dt * BK, q_stride_b, q_stride_n, q_stride_h);
         }
@@ -2423,13 +2437,8 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
     for (int qg = 0; qg < QGroups; ++qg) {
 #pragma unroll
       for (int dt = 0; dt < DTiles; ++dt) {
-        int64_t q_off;
-        if constexpr (HndContiguous) {
-          q_off = q_head_base + q_start[qg] * HeadDim + dt * BK;
-        } else {
-          q_off = qkv_offset(
-              tensor_layout, b, hq, q_start[qg], dt * BK, q_stride_b, q_stride_n, q_stride_h);
-        }
+        const int64_t q_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
+            tensor_layout, b, hq, q_start[qg], dt * BK, q_stride_b, q_stride_n, q_stride_h);
         rocwmma::load_matrix_sync(q_frag[qg][dt], q + q_off, static_cast<uint32_t>(q_stride_n));
       }
     }
@@ -2466,7 +2475,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
         const int elem_base = pack * PackElems;
         const int n = elem_base / HeadDim;
         const int d = elem_base - n * HeadDim;
-        const int64_t k_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+        const int64_t k_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
             tensor_layout, b, hkv, kb_base + n, d, k_stride_b, k_stride_n, k_stride_h);
         const uint4 raw = *reinterpret_cast<const uint4*>(k + k_off);
         const KeyT* values = reinterpret_cast<const KeyT*>(&raw);
@@ -2488,7 +2497,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
         const int elem_base = pack * PackElems;
         const int n = elem_base / HeadDim;
         const int d = elem_base - n * HeadDim;
-        const int64_t k_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+        const int64_t k_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
             tensor_layout, b, hkv, kb_base + n, d, k_stride_b, k_stride_n, k_stride_h);
         const uint4 raw = *reinterpret_cast<const uint4*>(k + k_off);
         const KeyT* values = reinterpret_cast<const KeyT*>(&raw);
@@ -2521,13 +2530,8 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
       for (int vec = tid; vec < BC * KVecsPerRow; vec += Threads) {
         const int n = vec / KVecsPerRow;
         const int d = (vec - n * KVecsPerRow) * KVecBytes;
-        int64_t k_off;
-        if constexpr (HndContiguous) {
-          k_off = k_head_base + (kb_base + n) * HeadDim + d;
-        } else {
-          k_off = qkv_offset(
-              tensor_layout, b, hkv, kb_base + n, d, k_stride_b, k_stride_n, k_stride_h);
-        }
+        const int64_t k_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
+            tensor_layout, b, hkv, kb_base + n, d, k_stride_b, k_stride_n, k_stride_h);
         *reinterpret_cast<uint4*>(&k_tile[n][d]) =
             *reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(k) + k_off);
       }
@@ -2571,7 +2575,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
         for (int vec = tid; vec < BC * VVecsPerRow; vec += Threads) {
           const int n = vec / VVecsPerRow;
           const int d_base = (vec - n * VVecsPerRow) * VElemsPerVec;
-          const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+          const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
               tensor_layout, b, hkv, kb_base + n, d_base, v_stride_b, v_stride_n, v_stride_h);
           const uint4 packed = *reinterpret_cast<const uint4*>(v + v_off);
           const __half* vals = reinterpret_cast<const __half*>(&packed);
@@ -2605,7 +2609,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
       for (int vec = tid; vec < BC * VVecsPerRow; vec += Threads) {
         const int n = vec / VVecsPerRow;
         const int d = (vec - n * VVecsPerRow) * VElemsPerVec;
-        const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+        const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
             tensor_layout, b, hkv, kb_base + n, d, v_stride_b, v_stride_n, v_stride_h);
         const uint4 packed = *reinterpret_cast<const uint4*>(v + v_off);
         const __half* vals = reinterpret_cast<const __half*>(&packed);
@@ -2620,7 +2624,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
       for (int vec = tid; vec < BC * VVecsPerRow; vec += Threads) {
         const int n = vec / VVecsPerRow;
         const int d = (vec - n * VVecsPerRow) * VElemsPerVec;
-        const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous>(
+        const int64_t v_off = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
             tensor_layout, b, hkv, kb_base + n, d, v_stride_b, v_stride_n, v_stride_h);
         *reinterpret_cast<uint4*>(&v_tile[n][d]) =
             *reinterpret_cast<const uint4*>(v + v_off);
@@ -2725,7 +2729,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                 }
               }
             }
-            if (k_col_start + BK > kv_len) {
+            if constexpr (!NoKvTail) if (k_col_start + BK > kv_len) {
               apply_tqk_kv_tail_mask<PvOrderedQK>(
                   scores0[gc], kv_len, kb_base, col_tile, lane);
               apply_tqk_kv_tail_mask<PvOrderedQK>(
@@ -2923,7 +2927,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
               }
             }
           }
-          if (k_col_start + BK > kv_len) {
+          if constexpr (!NoKvTail) if (k_col_start + BK > kv_len) {
             apply_tqk_kv_tail_mask<PvOrderedQK>(
                 scores0, kv_len, kb_base, col_tile, lane);
             apply_tqk_kv_tail_mask<PvOrderedQK>(
@@ -3026,7 +3030,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                 }
               }
             }
-            if (k_col_start + BK > kv_len) {
+            if constexpr (!NoKvTail) if (k_col_start + BK > kv_len) {
               apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
             }
             score_cache[col_tile] = scores;
@@ -3180,7 +3184,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                   scores, static_cast<int>(q_start[qg]), static_cast<int>(kb_base), col_tile, lane);
             }
           }
-          if (kb_base + static_cast<int64_t>(col_tile) * BK + BK > kv_len) {
+          if constexpr (!NoKvTail) if (kb_base + static_cast<int64_t>(col_tile) * BK + BK > kv_len) {
             apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
           }
 #pragma unroll
@@ -3239,7 +3243,7 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
                   scores, static_cast<int>(q_start[qg]), static_cast<int>(kb_base), col_tile, lane);
             }
           }
-          if (kb_base + static_cast<int64_t>(col_tile) * BK + BK > kv_len) {
+          if constexpr (!NoKvTail) if (kb_base + static_cast<int64_t>(col_tile) * BK + BK > kv_len) {
             apply_tqk_kv_tail_mask<false>(scores, kv_len, kb_base, col_tile, lane);
           }
           half8_vec prob_values;
@@ -3328,22 +3332,20 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
         const int64_t q_idx1 = q_idx0 + 1;
         const float value0 = static_cast<float>(out_frag[qg][dt][elem]) * inv_l_rows[elem];
         const float value1 = static_cast<float>(out_frag[qg][dt][elem + 1]) * inv_l_rows[elem + 1];
-        int64_t o_off0;
-        int64_t o_off1;
-        if constexpr (HndContiguous) {
-          o_off0 = o_head_base + q_idx0 * HeadDim + d;
-          o_off1 = o_head_base + q_idx1 * HeadDim + d;
-        } else {
-          o_off0 = qkv_offset(
-              tensor_layout, b, hq, q_idx0, d, o_stride_b, o_stride_n, o_stride_h);
-          o_off1 = qkv_offset(
-              tensor_layout, b, hq, q_idx1, d, o_stride_b, o_stride_n, o_stride_h);
-        }
-        if (q_idx0 < qo_len) {
+        const int64_t o_off0 = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
+            tensor_layout, b, hq, q_idx0, d, o_stride_b, o_stride_n, o_stride_h);
+        const int64_t o_off1 = qkv_offset_dispatch<HeadDim, HndContiguous, StaticNhdLayout>(
+            tensor_layout, b, hq, q_idx1, d, o_stride_b, o_stride_n, o_stride_h);
+        if constexpr (NoQueryTail) {
           store_half(output, o_off0, value0);
-        }
-        if (q_idx1 < qo_len) {
           store_half(output, o_off1, value1);
+        } else {
+          if (q_idx0 < qo_len) {
+            store_half(output, o_off0, value0);
+          }
+          if (q_idx1 < qo_len) {
+            store_half(output, o_off1, value1);
+          }
         }
       }
     }
@@ -8759,9 +8761,17 @@ torch::Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   const bool use_d128_short_stream =
       is_causal && head_dim == 128 && block_rows == 128 && q_len <= 1024;
+  const bool use_static_nhd_no_tail =
+      query.scalar_type() == torch::kFloat16 &&
+      tensor_layout == kNHD && q_heads == kv_heads &&
+      block_rows == 128 &&
+      ((!is_causal && (q_len == 512 || q_len == 1024)) ||
+       (is_causal && (q_len == 512 || q_len == 1024))) &&
+      q_len == padded_kv_len && kv_len == padded_kv_len &&
+      (head_dim == 64 || head_dim == 128);
 
-#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_) \
-  qk_int8_sv_f16_d64_native_2q_kernel<64, HND_, BR_, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD, CAUSAL_, false, F16ACC_, QUERY_T_, true, int8_t, false, false, false, STREAM_, false, HD_><<<grid, block, 0, stream>>>( \
+#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE(BC_, HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, PVORDER_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_) \
+  qk_int8_sv_f16_d64_native_2q_kernel<BC_, HND_, BR_, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD, CAUSAL_, false, F16ACC_, QUERY_T_, true, int8_t, false, PVORDER_, false, STREAM_, false, HD_, false, false, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_><<<grid, block, 0, stream>>>( \
       reinterpret_cast<const QUERY_T_*>(query.data_ptr()), key.data_ptr<int8_t>(), \
       reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
       reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -8773,26 +8783,51 @@ torch::Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
       output.stride(0), output.stride(tensor_layout == kNHD ? 1 : 2), output.stride(tensor_layout == kNHD ? 2 : 1), \
       0, 0, key_scale.stride(0), key_scale.stride(1), \
       tensor_layout, sm_scale, false)
+#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT(HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_) \
+  SAGEATTN_LAUNCH_RAWQ_F16_VALUE(64, HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, false, false, false, false, false)
+#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_) \
+  SAGEATTN_LAUNCH_RAWQ_F16_VALUE(BC_, HD_, false, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, true, true, true, true, true)
 #define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(HD_, HND_, QUERY_T_) \
   if (is_causal) { \
     if (pv_accum_mode == 1) { \
-      if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, true, QUERY_T_, true, false); } \
-      else if ((HD_) == 128 && use_d128_short_stream) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, true, QUERY_T_, true, true); } \
-      else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, true, QUERY_T_, true, false); } \
+      if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT(HD_, HND_, 64, true, QUERY_T_, true, false); } \
+      else if ((HD_) == 128 && use_d128_short_stream) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT(HD_, HND_, 128, true, QUERY_T_, true, true); } \
+      else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT(HD_, HND_, 128, true, QUERY_T_, true, false); } \
     } else { \
-      if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, true, QUERY_T_, false, false); } \
-      else if ((HD_) == 128 && use_d128_short_stream) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, true, QUERY_T_, false, true); } \
-      else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, true, QUERY_T_, false, false); } \
+      if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT(HD_, HND_, 64, true, QUERY_T_, false, false); } \
+      else if ((HD_) == 128 && use_d128_short_stream) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT(HD_, HND_, 128, true, QUERY_T_, false, true); } \
+      else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT(HD_, HND_, 128, true, QUERY_T_, false, false); } \
     } \
   } else if (pv_accum_mode == 1) { \
-    if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, false, QUERY_T_, true, false); } \
-    else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, false, QUERY_T_, true, false); } \
+    if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT(HD_, HND_, 64, false, QUERY_T_, true, false); } \
+    else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT(HD_, HND_, 128, false, QUERY_T_, true, false); } \
   } else { \
-    if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 64, false, QUERY_T_, false, false); } \
-    else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE(HD_, HND_, 128, false, QUERY_T_, false, false); } \
+    if (block_rows == 64) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT(HD_, HND_, 64, false, QUERY_T_, false, false); } \
+    else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT(HD_, HND_, 128, false, QUERY_T_, false, false); } \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_BC_DTYPE(BC_, HD_, QUERY_T_) \
+  if (is_causal && pv_accum_mode == 1) { \
+    if ((HD_) == 128 && use_d128_short_stream) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, 128, true, QUERY_T_, true, true); } \
+    else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, 128, true, QUERY_T_, true, false); } \
+  } else if (is_causal) { \
+    if ((HD_) == 128 && use_d128_short_stream) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, 128, true, QUERY_T_, false, true); } \
+    else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, 128, true, QUERY_T_, false, false); } \
+  } else if (pv_accum_mode == 1) { \
+    SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, 128, false, QUERY_T_, true, false); \
+  } else { \
+    SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, 128, false, QUERY_T_, false, false); \
+  }
+#define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_DTYPE(HD_, QUERY_T_) \
+  if ((HD_) == 128 && q_len == 512) { \
+    SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_BC_DTYPE(32, HD_, QUERY_T_); \
+  } else { \
+    SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_BC_DTYPE(64, HD_, QUERY_T_); \
   }
 #define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_DTYPE(QUERY_T_) \
-  if (hnd_contiguous) { \
+  if (use_static_nhd_no_tail) { \
+    if (head_dim == 64) { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_DTYPE(64, QUERY_T_); } \
+    else { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_DTYPE(128, QUERY_T_); } \
+  } else if (hnd_contiguous) { \
     if (head_dim == 16) { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(16, true, QUERY_T_); } \
     else if (head_dim == 64) { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(64, true, QUERY_T_); } \
     else { SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(128, true, QUERY_T_); } \
@@ -8807,7 +8842,11 @@ torch::Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
     SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_DTYPE(__hip_bfloat16);
   }
 #undef SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_DTYPE
+#undef SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_DTYPE
+#undef SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_BC_DTYPE
 #undef SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND
+#undef SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD
+#undef SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT
 #undef SAGEATTN_LAUNCH_RAWQ_F16_VALUE
   hip_kernel_launch_check();
   return torch::empty({0}, query.options().dtype(torch::kFloat32));
