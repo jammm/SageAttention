@@ -8989,6 +8989,8 @@ torch::Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   const bool use_d128_short_stream =
       is_causal && head_dim == 128 && block_rows == 128 && q_len <= 1024;
+  const bool use_f16_d64_static_long =
+      head_dim == 64 && (q_len == 2048 || q_len == 4096 || q_len == 8192);
   const bool use_f16_d128_static_long =
       head_dim == 128 && (q_len == 2048 || q_len == 4096 || q_len == 8192);
   const bool use_static_nhd_no_tail =
@@ -8997,6 +8999,7 @@ torch::Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
       block_rows == 128 &&
       ((!is_causal && (q_len == 512 || q_len == 1024)) ||
        (is_causal && (q_len == 512 || q_len == 1024)) ||
+       use_f16_d64_static_long ||
        use_f16_d128_static_long) &&
       q_len == padded_kv_len && kv_len == padded_kv_len &&
       (head_dim == 64 || head_dim == 128);
