@@ -675,7 +675,8 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
         const auto stream = at::cuda::getCurrentCUDAStream();
 
         if constexpr (HEAD_DIM == 128 && BLOCK_SIZE == 64) {
-          if (num_tokens == 512 || num_tokens == 1024) {
+          if (num_tokens == 512 || num_tokens == 1024 ||
+              num_tokens == 2048 || num_tokens == 4096 || num_tokens == 8192) {
             constexpr int num_pack_per_thread = 2;
             dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
             QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, true, c_type><<<grid, block, 0, stream>>>(
