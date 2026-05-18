@@ -76,6 +76,14 @@ torch::Tensor qk_rawq_int8_sv_f8_scaled_native_attn_gfx12(
     int value_transposed_hnd = -1,
     int key_hnd_layout = 0);
 
+torch::Tensor sage_fp8_nhd_short_mha_gfx12(
+    torch::Tensor query,
+    torch::Tensor key,
+    torch::Tensor value,
+    int is_causal,
+    float sm_scale,
+    double scale_max);
+
 torch::Tensor qk_int8_sv_f16_d64_prepare_attn_hnd_gfx12(
     torch::Tensor query,
     torch::Tensor key,

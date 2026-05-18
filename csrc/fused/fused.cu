@@ -501,8 +501,9 @@ void quant_per_block_int8_cuda(
         constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
 
         dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+        const auto stream = at::cuda::getCurrentCUDAStream();
 
-        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, true, false, c_type><<<grid, block>>>(
+        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, true, false, c_type><<<grid, block, 0, stream>>>(
           reinterpret_cast<c_type*>(input.data_ptr()),
           nullptr,
           output.data_ptr<int8_t>(),
@@ -583,8 +584,9 @@ void quant_per_block_int8_cuda(
         constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
 
         dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+        const auto stream = at::cuda::getCurrentCUDAStream();
 
-        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block>>>(
+        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block, 0, stream>>>(
           reinterpret_cast<c_type*>(input.data_ptr()),
           nullptr,
           output.data_ptr<int8_t>(),
@@ -670,22 +672,57 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
 
         dim3 grid((num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE, num_heads, batch_size);
 
-        constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
+        const auto stream = at::cuda::getCurrentCUDAStream();
 
-        dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
-
-        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, true, c_type><<<grid, block>>>(
-          reinterpret_cast<c_type*>(input.data_ptr()),
-          reinterpret_cast<c_type*>(mean.data_ptr()),
-          output.data_ptr<int8_t>(),
-          reinterpret_cast<float*>(scale.data_ptr()),
-          0.0f,
-          num_tokens,
-          stride_bz_input, stride_seq_input, stride_h_input,
-          mean.stride(0), mean.stride(1),
-          stride_bz_output, stride_seq_output, stride_h_output,
-          scale.stride(0), scale.stride(1)
-        );
+        if constexpr (HEAD_DIM == 128 && BLOCK_SIZE == 64) {
+          if (num_tokens == 512 || num_tokens == 1024) {
+            constexpr int num_pack_per_thread = 2;
+            dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+            QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, true, c_type><<<grid, block, 0, stream>>>(
+              reinterpret_cast<c_type*>(input.data_ptr()),
+              reinterpret_cast<c_type*>(mean.data_ptr()),
+              output.data_ptr<int8_t>(),
+              reinterpret_cast<float*>(scale.data_ptr()),
+              0.0f,
+              num_tokens,
+              stride_bz_input, stride_seq_input, stride_h_input,
+              mean.stride(0), mean.stride(1),
+              stride_bz_output, stride_seq_output, stride_h_output,
+              scale.stride(0), scale.stride(1)
+            );
+          } else
+          {
+            constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
+            dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+            QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, true, c_type><<<grid, block, 0, stream>>>(
+              reinterpret_cast<c_type*>(input.data_ptr()),
+              reinterpret_cast<c_type*>(mean.data_ptr()),
+              output.data_ptr<int8_t>(),
+              reinterpret_cast<float*>(scale.data_ptr()),
+              0.0f,
+              num_tokens,
+              stride_bz_input, stride_seq_input, stride_h_input,
+              mean.stride(0), mean.stride(1),
+              stride_bz_output, stride_seq_output, stride_h_output,
+              scale.stride(0), scale.stride(1)
+            );
+          }
+        } else {
+          constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
+          dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+          QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, true, c_type><<<grid, block, 0, stream>>>(
+            reinterpret_cast<c_type*>(input.data_ptr()),
+            reinterpret_cast<c_type*>(mean.data_ptr()),
+            output.data_ptr<int8_t>(),
+            reinterpret_cast<float*>(scale.data_ptr()),
+            0.0f,
+            num_tokens,
+            stride_bz_input, stride_seq_input, stride_h_input,
+            mean.stride(0), mean.stride(1),
+            stride_bz_output, stride_seq_output, stride_h_output,
+            scale.stride(0), scale.stride(1)
+          );
+        }
       });
     });
   });
@@ -758,8 +795,9 @@ void quant_per_warp_int8_cuda(
           constexpr int num_pack_per_thread = (WARP_BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
 
           dim3 block(WARP_BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+          const auto stream = at::cuda::getCurrentCUDAStream();
 
-          QuantInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block>>>(
+          QuantInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block, 0, stream>>>(
             reinterpret_cast<c_type*>(input.data_ptr()),
             nullptr,
             output.data_ptr<int8_t>(),
@@ -843,8 +881,9 @@ void sub_mean_cuda(
         constexpr int num_pack_per_thread = (BLOCK_SIZE * (HEAD_DIM / 8) + 1023) / 1024;
 
         dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
+        const auto stream = at::cuda::getCurrentCUDAStream();
 
-        SubMeanKernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread><<<grid, block>>>(
+        SubMeanKernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread><<<grid, block, 0, stream>>>(
           reinterpret_cast<c_type*>(input.data_ptr()),
           reinterpret_cast<c_type*>(mean.data_ptr()),
           reinterpret_cast<half*>(output.data_ptr()),
@@ -920,8 +959,9 @@ void transpose_pad_permute_cuda(
       static_assert(CTA_SIZE * HEAD_DIM <= 8192);
 
       dim3 block(CTA_SIZE * (HEAD_DIM / 8));
+      const auto stream = at::cuda::getCurrentCUDAStream();
 
-      TransposePadPermuteKernel<HEAD_DIM, CTA_SIZE, true, c_type><<<grid, block>>>(
+      TransposePadPermuteKernel<HEAD_DIM, CTA_SIZE, true, c_type><<<grid, block, 0, stream>>>(
         reinterpret_cast<c_type*>(input.data_ptr()),
         reinterpret_cast<c_type*>(output.data_ptr()),
         num_tokens,
@@ -994,7 +1034,8 @@ void scale_fuse_quant_cuda(
   auto input_dtype = input.scalar_type();
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-    MeanScaleKernel<64, false, c_type><<<grid, block>>>(
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    MeanScaleKernel<64, false, c_type><<<grid, block, 0, stream>>>(
       reinterpret_cast<c_type*>(input.data_ptr()),
       reinterpret_cast<int8_t*>(output.data_ptr()),
       nullptr,
@@ -1077,7 +1118,8 @@ void mean_scale_fuse_quant_cuda(
   auto input_dtype = input.scalar_type();
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-    MeanScaleKernel<64, true, c_type><<<grid, block>>>(
+    const auto stream = at::cuda::getCurrentCUDAStream();
+    MeanScaleKernel<64, true, c_type><<<grid, block, 0, stream>>>(
       reinterpret_cast<c_type*>(input.data_ptr()),
       reinterpret_cast<int8_t*>(output.data_ptr()),
       reinterpret_cast<float*>(mean.data_ptr()),

@@ -101,6 +101,39 @@ def _get_gfx12_native_extension():
     return _qattn_gfx12_native
 
 
+def _try_gfx12_fp8_nhd_short_mha(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    is_causal: bool,
+    sm_scale: float,
+    fp8_value_scale_max: float,
+) -> Optional[torch.Tensor]:
+    if not (
+        q.is_cuda
+        and k.is_cuda
+        and v.is_cuda
+        and q.device == k.device == v.device
+        and q.dtype == k.dtype == v.dtype == torch.float16
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and v.is_contiguous()
+        and q.dim() == 4
+        and k.dim() == 4
+        and v.dim() == 4
+        and q.shape == k.shape == v.shape
+        and q.size(1) in (512, 1024, 2048, 4096, 8192)
+        and q.size(3) in (64, 128)
+    ):
+        return None
+
+    torch.cuda.set_device(q.device)
+    gfx12_native = _get_gfx12_native_extension()
+    return gfx12_native.sage_fp8_nhd_short_mha(
+        q, k, v, int(is_causal), float(sm_scale), float(fp8_value_scale_max)
+    )
+
+
 def _round_up_to_multiple(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
@@ -424,6 +457,13 @@ def sageattn_qk_int8_pv_gfx12_native(
         if value_dtype == "fp8" and head_dim not in (16, 64, 128):
             raise ValueError("gfx12 fp8 value path currently supports head_dim 16, 64, or 128.")
 
+        use_gfx12_fp8_nhd_mha_wrapper = (
+            value_dtype == "fp8"
+            and input_dtype == torch.float16
+            and qo_len == kv_len
+            and kv_len in (512, 1024, 2048, 4096, 8192)
+            and head_dim in (64, 128)
+        )
         use_short_nhd_fp8_prep = (
             value_dtype == "fp8"
             and input_dtype == torch.float16
@@ -431,6 +471,12 @@ def sageattn_qk_int8_pv_gfx12_native(
             and kv_len in (512, 1024)
             and head_dim in (64, 128)
         )
+        if use_gfx12_fp8_nhd_mha_wrapper and head_dim_og in (64, 128) and h_qo == h_kv:
+            out = _try_gfx12_fp8_nhd_short_mha(
+                q_nhd, k_nhd, v_nhd, is_causal, float(sm_scale), fp8_value_scale_max
+            )
+            if out is not None:
+                return _with_lse(out)
         value_native = None
         value_scale = None
         if use_short_nhd_fp8_prep:
@@ -846,6 +892,45 @@ def sageattn(
         
     arch = get_cuda_arch_versions()[q.device.index]
     if arch.startswith("gfx12"):
+        fast_path_keys = {"value_dtype", "smooth_k", "qk_quant_gran", "pv_accum_dtype", "smooth_v"}
+        value_dtype = kwargs.get("value_dtype", "auto")
+        value_dtype = value_dtype.lower() if isinstance(value_dtype, str) else value_dtype
+        gfx12_fast_common = (
+            not return_lse
+            and tensor_layout == "NHD"
+            and set(kwargs).issubset(fast_path_keys)
+            and kwargs.get("smooth_k", True)
+            and kwargs.get("qk_quant_gran", "per_warp") == "per_warp"
+            and not kwargs.get("smooth_v", False)
+            and q.is_cuda
+            and k.is_cuda
+            and v.is_cuda
+            and q.device == k.device == v.device
+            and q.dtype == k.dtype == v.dtype == torch.float16
+            and q.is_contiguous()
+            and k.is_contiguous()
+            and v.is_contiguous()
+            and q.dim() == 4
+            and k.dim() == 4
+            and v.dim() == 4
+            and q.size(0) == k.size(0) == v.size(0)
+            and q.size(1) == k.size(1) == v.size(1)
+            and q.size(2) == k.size(2) == v.size(2)
+            and q.size(3) == k.size(3) == v.size(3)
+            and q.size(1) in (512, 1024, 2048, 4096, 8192)
+            and q.size(3) in (64, 128)
+        )
+        if (
+            gfx12_fast_common
+            and value_dtype in {"auto", "fp8"}
+            and kwargs.get("pv_accum_dtype", None) in {None, "fp32+fp16"}
+        ):
+            fast_sm_scale = float(sm_scale if sm_scale is not None else q.size(-1) ** -0.5)
+            out = _try_gfx12_fp8_nhd_short_mha(
+                q, k, v, is_causal, fast_sm_scale, _GFX12_FP8_VALUE_SCALE_MAX_FP32_FP16
+            )
+            if out is not None:
+                return out
         return sageattn_qk_int8_pv_gfx12_native(
             q, k, v, tensor_layout=tensor_layout, is_causal=is_causal,
             sm_scale=sm_scale, return_lse=return_lse, **kwargs)
