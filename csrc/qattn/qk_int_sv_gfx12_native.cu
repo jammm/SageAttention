@@ -2370,7 +2370,9 @@ template <int BlockCols,
           bool StaticNhdLayout = false,
           bool NoKvTail = false,
           bool SameQKHeads = false,
-          bool NoQueryTail = false>
+          bool NoQueryTail = false,
+          bool PrefetchStreamVRegs = false,
+          bool DirectStreamProbs = false>
 SAGEATTN_NATIVE_2Q_WAVES_PER_EU(HeadDim, IsCausal) __global__
 SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2q_kernel(
     const QueryT* __restrict__ q,
@@ -2597,7 +2599,12 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
     }
   }
 
-  const int64_t kv_limit = IsCausal && (q_base + BR) < kv_len ? q_base + BR : kv_len;
+  constexpr bool ExactStaticCausalBlock =
+      IsCausal && StaticNhdLayout && NoKvTail && NoQueryTail &&
+      (BR % BC == 0);
+  const int64_t kv_limit =
+      ExactStaticCausalBlock ? (q_base + BR) :
+      (IsCausal && (q_base + BR) < kv_len ? q_base + BR : kv_len);
   auto process_kv_tile = [&](const int64_t kb_base, auto apply_causal_mask_tag) {
     constexpr int KVecBytes = 16;
     constexpr int KBytesPerRow = HeadDim;
@@ -2876,102 +2883,242 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
             continue;
           }
 
-          half8_vec p_regs[QGroups][StreamGroupCols];
+          if constexpr (DirectStreamProbs) {
+            float local_sums[QGroups];
 #pragma unroll
-          for (int qg = 0; qg < QGroups; ++qg) {
-            float local_max = -FLT_MAX * 0.5f;
+            for (int qg = 0; qg < QGroups; ++qg) {
+              float local_max = -FLT_MAX * 0.5f;
 #pragma unroll
-            for (int gc = 0; gc < StreamGroupCols; ++gc) {
+              for (int gc = 0; gc < StreamGroupCols; ++gc) {
 #pragma unroll
-              for (int elem = 0; elem < 8; ++elem) {
-                const float score = qg == 0 ? scores0[gc][elem] : scores1[gc][elem];
-                local_max = fmaxf(local_max, score);
-              }
-            }
-            const float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
-            const float old_m = m[qg];
-            const float new_m = fmaxf(old_m, tile_max);
-            const float alpha = l[qg] == 0.0f ? 0.0f : fast_exp2(old_m - new_m);
-            m[qg] = new_m;
-            l[qg] *= alpha;
-
-            float8_vec alpha_rows;
-#pragma unroll
-            for (int elem = 0; elem < 8; ++elem) {
-              alpha_rows[elem] = __shfl(alpha, row_base + elem, 32);
-            }
-
-#pragma unroll
-            for (int dt = 0; dt < DTiles; ++dt) {
-#pragma unroll
-              for (int elem = 0; elem < 8; ++elem) {
-                out_frag[qg][dt][elem] *= alpha_rows[elem];
-              }
-            }
-
-            float local_sum = 0.0f;
-#pragma unroll
-            for (int gc = 0; gc < StreamGroupCols; ++gc) {
-              half8_vec prob_values;
-#pragma unroll
-              for (int elem = 0; elem < 8; ++elem) {
-                const float score = qg == 0 ? scores0[gc][elem] : scores1[gc][elem];
-                float prob = 0.0f;
-                if (!fully_future[qg][gc]) {
-                  prob = fast_exp2(score - m[qg] + kF16SoftmaxOffset);
-                  local_sum += prob;
+                for (int elem = 0; elem < 8; ++elem) {
+                  const float score = qg == 0 ? scores0[gc][elem] : scores1[gc][elem];
+                  local_max = fmaxf(local_max, score);
                 }
-                prob_values[elem] = static_cast<_Float16>(prob);
               }
-              if constexpr (PvOrderedQK) {
-                p_regs[qg][gc] = prob_values;
-              } else {
-                p_regs[qg][gc] = make_p_regs_from_tqk_prob_regs(prob_values, lane);
+              const float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
+              const float old_m = m[qg];
+              const float new_m = fmaxf(old_m, tile_max);
+              const float alpha = l[qg] == 0.0f ? 0.0f : fast_exp2(old_m - new_m);
+              m[qg] = new_m;
+              l[qg] *= alpha;
+              local_sums[qg] = 0.0f;
+
+              float8_vec alpha_rows;
+#pragma unroll
+              for (int elem = 0; elem < 8; ++elem) {
+                alpha_rows[elem] = __shfl(alpha, row_base + elem, 32);
               }
-            }
-            l[qg] += local_sum + __shfl_xor(local_sum, 16, 32);
-          }
 
 #pragma unroll
-          for (int gc = 0; gc < StreamGroupCols; ++gc) {
-            if (fully_future[0][gc] && fully_future[1][gc]) {
-              continue;
-            }
-            const int col_tile = group_base + gc;
+              for (int dt = 0; dt < DTiles; ++dt) {
 #pragma unroll
-            for (int dt = 0; dt < DTiles; ++dt) {
-              half8_vec v_regs;
-              if constexpr (UseLaneMajorValue) {
-                v_regs = make_v_regs_from_lane_major_shared<DTiles>(
-                    v_lane_tile, col_tile, dt, lane);
-              } else if constexpr (UseTransposedValueLayout) {
-                v_regs = make_v_regs_from_transposed_shared<SharedValueStride>(
-                    &v_tile[0][0], col_tile, dt, lane);
-              } else {
-                v_regs = make_v_regs_from_shared<SharedValueStride>(
-                    &v_tile[0][0], col_tile, dt, lane);
+                for (int elem = 0; elem < 8; ++elem) {
+                  out_frag[qg][dt][elem] *= alpha_rows[elem];
+                }
               }
+            }
+
+#pragma unroll
+            for (int gc = 0; gc < StreamGroupCols; ++gc) {
+              if (fully_future[0][gc] && fully_future[1][gc]) {
+                continue;
+              }
+              half8_vec p_regs_current[QGroups];
 #pragma unroll
               for (int qg = 0; qg < QGroups; ++qg) {
-                if (fully_future[qg][gc]) {
-                  continue;
-                }
-                PvAccumVec acc;
+                half8_vec prob_values;
 #pragma unroll
                 for (int elem = 0; elem < 8; ++elem) {
-                  acc[elem] = out_frag[qg][dt][elem];
+                  const float score = qg == 0 ? scores0[gc][elem] : scores1[gc][elem];
+                  float prob = 0.0f;
+                  if (!fully_future[qg][gc]) {
+                    prob = fast_exp2(score - m[qg] + kF16SoftmaxOffset);
+                    local_sums[qg] += prob;
+                  }
+                  prob_values[elem] = static_cast<_Float16>(prob);
                 }
-                PvAccumVec pv_acc;
-                if constexpr (F16PvAccum) {
-                  pv_acc =
-                      __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(p_regs[qg][gc], v_regs, acc);
+                if constexpr (PvOrderedQK) {
+                  p_regs_current[qg] = prob_values;
                 } else {
-                  pv_acc =
-                      __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_regs[qg][gc], v_regs, acc);
+                  p_regs_current[qg] = make_p_regs_from_tqk_prob_regs(prob_values, lane);
                 }
+              }
+              const int col_tile = group_base + gc;
+              auto load_stream_v_regs = [&](const int dt) {
+                half8_vec v_regs;
+                if constexpr (UseLaneMajorValue) {
+                  v_regs = make_v_regs_from_lane_major_shared<DTiles>(
+                      v_lane_tile, col_tile, dt, lane);
+                } else if constexpr (UseTransposedValueLayout) {
+                  v_regs = make_v_regs_from_transposed_shared<SharedValueStride>(
+                      &v_tile[0][0], col_tile, dt, lane);
+                } else {
+                  v_regs = make_v_regs_from_shared<SharedValueStride>(
+                      &v_tile[0][0], col_tile, dt, lane);
+                }
+                return v_regs;
+              };
+              auto apply_stream_pv = [&](const int dt, const half8_vec v_regs) {
+#pragma unroll
+                for (int qg = 0; qg < QGroups; ++qg) {
+                  if (fully_future[qg][gc]) {
+                    continue;
+                  }
+                  PvAccumVec acc;
+#pragma unroll
+                  for (int elem = 0; elem < 8; ++elem) {
+                    acc[elem] = out_frag[qg][dt][elem];
+                  }
+                  if constexpr (F16PvAccum) {
+                    acc = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(
+                        p_regs_current[qg], v_regs, acc);
+                  } else {
+                    acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                        p_regs_current[qg], v_regs, acc);
+                  }
+#pragma unroll
+                  for (int elem = 0; elem < 8; ++elem) {
+                    out_frag[qg][dt][elem] = acc[elem];
+                  }
+                }
+              };
+              if constexpr (PrefetchStreamVRegs) {
+                half8_vec v_regs = load_stream_v_regs(0);
+#pragma unroll
+                for (int dt = 0; dt < DTiles - 1; ++dt) {
+                  const half8_vec next_v_regs = load_stream_v_regs(dt + 1);
+                  apply_stream_pv(dt, v_regs);
+                  v_regs = next_v_regs;
+                }
+                apply_stream_pv(DTiles - 1, v_regs);
+              } else {
+#pragma unroll
+                for (int dt = 0; dt < DTiles; ++dt) {
+                  const half8_vec v_regs = load_stream_v_regs(dt);
+                  apply_stream_pv(dt, v_regs);
+                }
+              }
+            }
+#pragma unroll
+            for (int qg = 0; qg < QGroups; ++qg) {
+              l[qg] += local_sums[qg] + __shfl_xor(local_sums[qg], 16, 32);
+            }
+          } else {
+            half8_vec p_regs[QGroups][StreamGroupCols];
+#pragma unroll
+            for (int qg = 0; qg < QGroups; ++qg) {
+              float local_max = -FLT_MAX * 0.5f;
+#pragma unroll
+              for (int gc = 0; gc < StreamGroupCols; ++gc) {
 #pragma unroll
                 for (int elem = 0; elem < 8; ++elem) {
-                  out_frag[qg][dt][elem] = pv_acc[elem];
+                  const float score = qg == 0 ? scores0[gc][elem] : scores1[gc][elem];
+                  local_max = fmaxf(local_max, score);
+                }
+              }
+              const float tile_max = fmaxf(local_max, __shfl_xor(local_max, 16, 32));
+              const float old_m = m[qg];
+              const float new_m = fmaxf(old_m, tile_max);
+              const float alpha = l[qg] == 0.0f ? 0.0f : fast_exp2(old_m - new_m);
+              m[qg] = new_m;
+              l[qg] *= alpha;
+
+              float8_vec alpha_rows;
+#pragma unroll
+              for (int elem = 0; elem < 8; ++elem) {
+                alpha_rows[elem] = __shfl(alpha, row_base + elem, 32);
+              }
+
+#pragma unroll
+              for (int dt = 0; dt < DTiles; ++dt) {
+#pragma unroll
+                for (int elem = 0; elem < 8; ++elem) {
+                  out_frag[qg][dt][elem] *= alpha_rows[elem];
+                }
+              }
+
+              float local_sum = 0.0f;
+#pragma unroll
+              for (int gc = 0; gc < StreamGroupCols; ++gc) {
+                half8_vec prob_values;
+#pragma unroll
+                for (int elem = 0; elem < 8; ++elem) {
+                  const float score = qg == 0 ? scores0[gc][elem] : scores1[gc][elem];
+                  float prob = 0.0f;
+                  if (!fully_future[qg][gc]) {
+                    prob = fast_exp2(score - m[qg] + kF16SoftmaxOffset);
+                    local_sum += prob;
+                  }
+                  prob_values[elem] = static_cast<_Float16>(prob);
+                }
+                if constexpr (PvOrderedQK) {
+                  p_regs[qg][gc] = prob_values;
+                } else {
+                  p_regs[qg][gc] = make_p_regs_from_tqk_prob_regs(prob_values, lane);
+                }
+              }
+              l[qg] += local_sum + __shfl_xor(local_sum, 16, 32);
+            }
+
+#pragma unroll
+            for (int gc = 0; gc < StreamGroupCols; ++gc) {
+              if (fully_future[0][gc] && fully_future[1][gc]) {
+                continue;
+              }
+              const int col_tile = group_base + gc;
+              auto load_stream_v_regs = [&](const int dt) {
+                half8_vec v_regs;
+                if constexpr (UseLaneMajorValue) {
+                  v_regs = make_v_regs_from_lane_major_shared<DTiles>(
+                      v_lane_tile, col_tile, dt, lane);
+                } else if constexpr (UseTransposedValueLayout) {
+                  v_regs = make_v_regs_from_transposed_shared<SharedValueStride>(
+                      &v_tile[0][0], col_tile, dt, lane);
+                } else {
+                  v_regs = make_v_regs_from_shared<SharedValueStride>(
+                      &v_tile[0][0], col_tile, dt, lane);
+                }
+                return v_regs;
+              };
+              auto apply_stream_pv = [&](const int dt, const half8_vec v_regs) {
+#pragma unroll
+                for (int qg = 0; qg < QGroups; ++qg) {
+                  if (fully_future[qg][gc]) {
+                    continue;
+                  }
+                  PvAccumVec acc;
+#pragma unroll
+                  for (int elem = 0; elem < 8; ++elem) {
+                    acc[elem] = out_frag[qg][dt][elem];
+                  }
+                  if constexpr (F16PvAccum) {
+                    acc = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(
+                        p_regs[qg][gc], v_regs, acc);
+                  } else {
+                    acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                        p_regs[qg][gc], v_regs, acc);
+                  }
+#pragma unroll
+                  for (int elem = 0; elem < 8; ++elem) {
+                    out_frag[qg][dt][elem] = acc[elem];
+                  }
+                }
+              };
+              if constexpr (PrefetchStreamVRegs) {
+                half8_vec v_regs = load_stream_v_regs(0);
+#pragma unroll
+                for (int dt = 0; dt < DTiles - 1; ++dt) {
+                  const half8_vec next_v_regs = load_stream_v_regs(dt + 1);
+                  apply_stream_pv(dt, v_regs);
+                  v_regs = next_v_regs;
+                }
+                apply_stream_pv(DTiles - 1, v_regs);
+              } else {
+#pragma unroll
+                for (int dt = 0; dt < DTiles; ++dt) {
+                  const half8_vec v_regs = load_stream_v_regs(dt);
+                  apply_stream_pv(dt, v_regs);
                 }
               }
             }
@@ -3249,17 +3396,16 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
           for (int elem = 0; elem < 8; ++elem) {
             acc0[elem] = out_frag[0][dt][elem];
           }
-          PvAccumVec pv_acc0;
           if constexpr (F16PvAccum) {
-            pv_acc0 =
-                __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(p_regs0, v_regs, acc0);
+            acc0 = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(
+                p_regs0, v_regs, acc0);
           } else {
-            pv_acc0 =
-                __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_regs0, v_regs, acc0);
+            acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                p_regs0, v_regs, acc0);
           }
 #pragma unroll
           for (int elem = 0; elem < 8; ++elem) {
-            out_frag[0][dt][elem] = pv_acc0[elem];
+            out_frag[0][dt][elem] = acc0[elem];
           }
           }
           const bool fully_future1 =
@@ -3271,17 +3417,16 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
           for (int elem = 0; elem < 8; ++elem) {
             acc1[elem] = out_frag[1][dt][elem];
           }
-          PvAccumVec pv_acc1;
           if constexpr (F16PvAccum) {
-            pv_acc1 =
-                __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(p_regs1, v_regs, acc1);
+            acc1 = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(
+                p_regs1, v_regs, acc1);
           } else {
-            pv_acc1 =
-                __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_regs1, v_regs, acc1);
+            acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                p_regs1, v_regs, acc1);
           }
 #pragma unroll
           for (int elem = 0; elem < 8; ++elem) {
-            out_frag[1][dt][elem] = pv_acc1[elem];
+            out_frag[1][dt][elem] = acc1[elem];
           }
           }
         }
@@ -3409,17 +3554,16 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
             for (int elem = 0; elem < 8; ++elem) {
               acc[elem] = out_frag[qg][dt][elem];
             }
-            PvAccumVec pv_acc;
             if constexpr (F16PvAccum) {
-              pv_acc =
-                  __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(p_regs, v_regs, acc);
+              acc = __builtin_amdgcn_wmma_f16_16x16x16_f16_w32_gfx12(
+                  p_regs, v_regs, acc);
             } else {
-              pv_acc =
-                  __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(p_regs, v_regs, acc);
+              acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                  p_regs, v_regs, acc);
             }
 #pragma unroll
             for (int elem = 0; elem < 8; ++elem) {
-              out_frag[qg][dt][elem] = pv_acc[elem];
+              out_frag[qg][dt][elem] = acc[elem];
             }
           }
         }
@@ -3434,8 +3578,8 @@ SAGEATTN_NATIVE_F16_2Q_LAUNCH_BOUNDS(BlockRows) void qk_int8_sv_f16_d64_native_2
   };
 
   if constexpr (IsCausal) {
-    const int64_t diag_base = (q_base / BC) * BC;
-    const int64_t prefix_limit = diag_base < kv_limit ? diag_base : kv_limit;
+    const int64_t prefix_limit = ExactStaticCausalBlock ?
+        q_base : (((q_base / BC) * BC) < kv_limit ? ((q_base / BC) * BC) : kv_limit);
 #pragma unroll 2
     for (int64_t kb_base = 0; kb_base < prefix_limit; kb_base += BC) {
       process_kv_tile(kb_base, std::false_type{});
@@ -8989,6 +9133,14 @@ torch::Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   const bool use_d128_short_stream =
       is_causal && head_dim == 128 && block_rows == 128 && q_len <= 1024;
+  const bool use_direct_stream_probs =
+      use_d128_short_stream && q_len == 1024 && pv_accum_mode != 1;
+  const bool use_d128_long_stream =
+      is_causal && head_dim == 128 && block_rows == 128 &&
+      q_len >= 2048 && pv_accum_mode != 1;
+  const bool use_d64_noncausal_stream_direct =
+      !is_causal && head_dim == 64 && block_rows == 128 &&
+      q_len >= 1024 && pv_accum_mode != 1;
   const bool use_f16_d64_static_long =
       head_dim == 64 && (q_len == 2048 || q_len == 4096 || q_len == 8192);
   const bool use_f16_d128_static_long =
@@ -9004,8 +9156,8 @@ torch::Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
       q_len == padded_kv_len && kv_len == padded_kv_len &&
       (head_dim == 64 || head_dim == 128);
 
-#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE(BC_, HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, PVORDER_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_) \
-  qk_int8_sv_f16_d64_native_2q_kernel<BC_, HND_, BR_, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD, CAUSAL_, false, F16ACC_, QUERY_T_, true, int8_t, false, PVORDER_, false, STREAM_, false, HD_, false, false, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_><<<grid, block, 0, stream>>>( \
+#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE(BC_, HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, PVORDER_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_, PREFETCH_STREAM_V_, DIRECT_STREAM_PROBS_) \
+  qk_int8_sv_f16_d64_native_2q_kernel<BC_, HND_, BR_, false, SAGEATTN_GFX12_NATIVE_F16_TV_PAD, CAUSAL_, false, F16ACC_, QUERY_T_, true, int8_t, false, PVORDER_, false, STREAM_, false, HD_, false, false, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_, PREFETCH_STREAM_V_, DIRECT_STREAM_PROBS_><<<grid, block, 0, stream>>>( \
       reinterpret_cast<const QUERY_T_*>(query.data_ptr()), key.data_ptr<int8_t>(), \
       reinterpret_cast<const __half*>(value.data_ptr<at::Half>()), \
       reinterpret_cast<__half*>(output.data_ptr<at::Half>()), \
@@ -9018,9 +9170,9 @@ torch::Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
       0, 0, key_scale.stride(0), key_scale.stride(1), \
       tensor_layout, sm_scale, false)
 #define SAGEATTN_LAUNCH_RAWQ_F16_VALUE_DEFAULT(HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_) \
-  SAGEATTN_LAUNCH_RAWQ_F16_VALUE(64, HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, false, false, false, false, false)
-#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_) \
-  SAGEATTN_LAUNCH_RAWQ_F16_VALUE(BC_, HD_, false, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, true, true, true, true, true)
+  SAGEATTN_LAUNCH_RAWQ_F16_VALUE(64, HD_, HND_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, false, false, false, false, false, false, false)
+#define SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, PREFETCH_STREAM_V_, DIRECT_STREAM_PROBS_) \
+  SAGEATTN_LAUNCH_RAWQ_F16_VALUE(BC_, HD_, false, BR_, CAUSAL_, QUERY_T_, F16ACC_, STREAM_, true, true, true, true, true, PREFETCH_STREAM_V_, DIRECT_STREAM_PROBS_)
 #define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_FOR_HND(HD_, HND_, QUERY_T_) \
   if (is_causal) { \
     if (pv_accum_mode == 1) { \
@@ -9041,21 +9193,34 @@ torch::Tensor qk_rawq_int8_sv_f16_native_attn_gfx12(
   }
 #define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_BC_BR_DTYPE(BC_, HD_, BR_, QUERY_T_) \
   if (is_causal && pv_accum_mode == 1) { \
-    if ((HD_) == 128 && use_d128_short_stream && (BR_) == 128) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, true, true); } \
-    else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, true, false); } \
+    if ((HD_) == 128 && use_d128_short_stream && (BR_) == 128) { \
+      SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, true, true, true, false); \
+    } else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, true, false, false, false); } \
   } else if (is_causal) { \
-    if ((HD_) == 128 && use_d128_short_stream && (BR_) == 128) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, false, true); } \
-    else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, false, false); } \
+    if ((HD_) == 128 && use_d128_short_stream && (BR_) == 128) { \
+      if (use_direct_stream_probs) { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, false, true, true, true); } \
+      else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, false, true, true, false); } \
+    } else if ((HD_) == 128 && (BR_) == 128 && use_d128_long_stream) { \
+      SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, false, true, true, false); \
+    } else { SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, true, QUERY_T_, false, false, false, false); } \
   } else if (pv_accum_mode == 1) { \
-    SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, false, QUERY_T_, true, false); \
+    SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, false, QUERY_T_, true, false, false, false); \
   } else { \
-    SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, false, QUERY_T_, false, false); \
+    if ((HD_) == 64 && use_d64_noncausal_stream_direct) { \
+      SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, false, QUERY_T_, false, true, true, true); \
+    } else { \
+      SAGEATTN_LAUNCH_RAWQ_F16_VALUE_STATIC_NHD(BC_, HD_, BR_, false, QUERY_T_, false, false, false, false); \
+    } \
   }
 #define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_BC_DTYPE(BC_, HD_, QUERY_T_) \
   SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_BC_BR_DTYPE(BC_, HD_, 128, QUERY_T_)
 #define SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_DTYPE(HD_, QUERY_T_) \
-  if ((HD_) == 128 && q_len == 512) { \
-    SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_BC_DTYPE(32, HD_, QUERY_T_); \
+  if constexpr ((HD_) == 128) { \
+    if (q_len == 512) { \
+      SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_BC_DTYPE(32, HD_, QUERY_T_); \
+    } else { \
+      SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_BC_DTYPE(64, HD_, QUERY_T_); \
+    } \
   } else { \
     SAGEATTN_DISPATCH_RAWQ_F16_VALUE_STATIC_NHD_FOR_BC_DTYPE(64, HD_, QUERY_T_); \
   }
