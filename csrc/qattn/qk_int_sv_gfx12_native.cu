@@ -5996,6 +5996,34 @@ torch::Tensor mean_nhd_gfx12(torch::Tensor input) {
   return mean;
 }
 
+torch::Tensor mean_nhd_d64_seq32_gfx12(torch::Tensor input) {
+  TORCH_CHECK(input.is_cuda(), "gfx12 D64 seq32 NHD mean expects a CUDA/HIP tensor");
+  TORCH_CHECK(input.dim() == 4, "gfx12 D64 seq32 NHD mean expects [B, S, H, D]");
+  TORCH_CHECK(input.is_contiguous(), "gfx12 D64 seq32 NHD mean expects contiguous NHD input");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat16,
+              "gfx12 D64 seq32 NHD mean supports fp16 input");
+
+  const int64_t batch = input.size(0);
+  const int64_t seq_len = input.size(1);
+  const int64_t heads = input.size(2);
+  const int64_t head_dim = input.size(3);
+  TORCH_CHECK(head_dim == 64,
+              "gfx12 D64 seq32 NHD mean expects head_dim 64");
+  TORCH_CHECK(seq_len == 2048 || seq_len == 4096 || seq_len == 8192,
+              "gfx12 D64 seq32 NHD mean expects sequence length 2048/4096/8192");
+
+  torch::Tensor mean = torch::empty({batch, heads, head_dim}, input.options());
+  dim3 block(1024);
+  dim3 grid((head_dim + 31) / 32, heads, batch);
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
+  mean_nhd_short_kernel<__half, 32, 32><<<grid, block, 0, stream>>>(
+      reinterpret_cast<const __half*>(input.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(mean.data_ptr<at::Half>()),
+      seq_len, heads, head_dim);
+  hip_kernel_launch_check();
+  return mean;
+}
+
 torch::Tensor mean_hnd_gfx12(torch::Tensor input) {
   TORCH_CHECK(input.is_cuda(), "gfx12 HND mean expects a CUDA/HIP tensor");
   TORCH_CHECK(input.dim() == 4, "gfx12 HND mean expects [B, H, S, D]");
