@@ -3799,8 +3799,8 @@ __global__ __launch_bounds__(BlockRows * (2 / QGroupsParam), 1) void qk_int8_sv_
   static_assert(!UsePrepackedLaneMajorValue ||
                     (HndContiguous && ValueTransposed && !QuantizeKeyValue),
                 "lane-major prepared fp8 V requires prepared transposed HND tensors.");
-  static_assert(ValueTiles == 1 || ValueTiles == 4 || ValueTiles == 8 || ValueTiles == 16,
-                "native fp8 2q stores one D16, D64, D128, or D256 value slice per launch.");
+  static_assert(ValueTiles == 1 || ValueTiles == 4 || ValueTiles == 8,
+                "native fp8 2q stores one D16, D64, or D128 value slice per launch.");
   static_assert(ValueTileBase + ValueTiles <= DTiles, "invalid fp8 value tile slice.");
   static_assert(!NoQueryTail || StaticNhdLayout,
                 "full-query fp8 path requires a static dispatch.");
@@ -8848,9 +8848,6 @@ static torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
   const dim3 block(block_rows);
   const dim3 grid(q_blocks, q_heads, batch);
   const hipStream_t stream = at::cuda::getCurrentCUDAStream();
-  const bool use_d256_fp8_single =
-      is_causal && head_dim == 256 && q_len == 512;
-
 #define SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_SLICE(BC_, HD_, VBASE_, VTILES_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_, INVL_) \
   qk_int8_sv_f8_native_2q_kernel<BC_, HD_, VBASE_, VTILES_, HND_, BR_, VT_, CAUSAL_, OUT_T_, QUERY_T_, true, int8_t, uint8_t, false, false, (VT_ ? -1 : 0), false, false, 2, false, false, KEY_HND_, STATIC_NHD_, NO_TAIL_, SAME_HEADS_, NO_Q_TAIL_, INVL_><<<grid, block, 0, stream>>>( \
       reinterpret_cast<const QUERY_T_*>(query.data_ptr<QUERY_AT_T_>()), \
@@ -8872,8 +8869,6 @@ static torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
     SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_SLICE(BC_, 256, 0, 8, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, false, false, false, false, false); \
     SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_SLICE(BC_, 256, 8, 8, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, false, false, false, false, false); \
   } while (false)
-#define SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256_SINGLE(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_) \
-  SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_SLICE(BC_, 256, 0, 16, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, false, false, false, false, false)
 #define SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256_STATIC_TWO() \
   do { \
     SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_SLICE(32, 256, 0, 8, false, false, 128, true, true, __half, __half, at::Half, at::Half, true, true, true, true, true); \
@@ -8883,11 +8878,9 @@ static torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
   SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX(BC_, HD_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, OUT_T_, QUERY_AT_T_, OUT_AT_T_, false, false, false, false, false)
 #define SAGEATTN_DISPATCH_RAWQ_FP8_OUT_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, QUERY_AT_T_) \
   if (output.scalar_type() == torch::kBFloat16) { \
-    if (use_d256_fp8_single) { SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256_SINGLE(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __hip_bfloat16, QUERY_AT_T_, at::BFloat16); } \
-    else { SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __hip_bfloat16, QUERY_AT_T_, at::BFloat16); } \
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __hip_bfloat16, QUERY_AT_T_, at::BFloat16); \
   } else { \
-    if (use_d256_fp8_single) { SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256_SINGLE(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __half, QUERY_AT_T_, at::Half); } \
-    else { SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __half, QUERY_AT_T_, at::Half); } \
+    SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_, QUERY_T_, __half, QUERY_AT_T_, at::Half); \
   }
 #define SAGEATTN_DISPATCH_RAWQ_FP8_QUERY_D256(BC_, HND_, KEY_HND_, BR_, VT_, CAUSAL_) \
   if (query.scalar_type() == torch::kBFloat16) { \
@@ -9016,7 +9009,6 @@ static torch::Tensor qk_rawq_int8_sv_f8_native_attn_gfx12_impl(
 #undef SAGEATTN_DISPATCH_RAWQ_FP8_OUT_D256
 #undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED
 #undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256
-#undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256_SINGLE
 #undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_D256_STATIC_TWO
 #undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_EX
 #undef SAGEATTN_LAUNCH_RAWQ_FP8_TYPED_SLICE
