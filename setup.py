@@ -102,14 +102,20 @@ if not SKIP_CUDA_BUILD:
         os.environ.setdefault("PYTORCH_ROCM_ARCH", ";".join(amd_arches))
         print(f"Target AMD GPU architectures: {amd_arches}")
 
+        # torch appends the standard its own headers need, but only when the extension
+        # sets none, so hardcoding one pins it. SAGEATTN_CXX_STD forces a value.
+        cxx_std = os.getenv("SAGEATTN_CXX_STD", "").strip()
+        msvc_std = [f"/std:{cxx_std}"] if cxx_std else []
+        clang_std = [f"-std={cxx_std}"] if cxx_std else []
+
         if os.name == "nt":
-            CXX_FLAGS = ["/O2", "/std:c++17", f"/D_GLIBCXX_USE_CXX11_ABI={ABI}", "/DENABLE_BF16"]
+            CXX_FLAGS = ["/O2", *msvc_std, f"/D_GLIBCXX_USE_CXX11_ABI={ABI}", "/DENABLE_BF16"]
         else:
-            CXX_FLAGS = ["-O3", "-std=c++17", f"-D_GLIBCXX_USE_CXX11_ABI={ABI}", "-DENABLE_BF16"]
+            CXX_FLAGS = ["-O3", *clang_std, f"-D_GLIBCXX_USE_CXX11_ABI={ABI}", "-DENABLE_BF16"]
 
         HIP_FLAGS = [
             "-O3",
-            "-std=c++17",
+            *clang_std,
             "-ffast-math",
             "-fgpu-flush-denormals-to-zero",
             "-fno-offload-uniform-block",
